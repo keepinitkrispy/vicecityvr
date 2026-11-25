@@ -49,8 +49,8 @@ class PsvrOutput(private val activity: Activity, display: Display, width: Int, h
     companion object {
         fun find(context: Context): Display? =
             context.getSystemService(DisplayManager::class.java)
-                .getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION)
-                .firstOrNull { it.isValid && (it.name.contains("SIE",true) || it.name.contains("PSVR",true)) &&
+                ?.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION)
+                ?.firstOrNull { it.isValid && (it.name.contains("SIE",true) || it.name.contains("PSVR",true)) &&
                     (it.mode.physicalWidth == 1920 && it.mode.physicalHeight == 1080) }
     }
     private val prefs = activity.getSharedPreferences("psvr_live",Context.MODE_PRIVATE)
