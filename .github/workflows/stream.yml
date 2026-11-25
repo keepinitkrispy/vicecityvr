@@ -26,6 +26,9 @@ jobs:
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: '17' }
 
+      - name: Host tools (protoc + python protobuf for Momiji's nanopb code generation)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler python3-protobuf > /dev/null && protoc --version
+
       - name: Android NDK and CMake
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${NDK_VERSION}" "cmake;3.22.1" > /dev/null
