@@ -1,4 +1,4 @@
-# psvr-control
+# Vice City VR (psvr-control)
 
 PS5 games in stereo 3D on a PSVR1 headset, with a Pixel phone as the processor.
 Test case: first-person GTA 6 over Remote Play. Goal: any game.
