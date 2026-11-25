@@ -1,0 +1,101 @@
+# Builds the Vice City VR stream app: Momiji (chiaki-ng based PS5 Remote Play) + motion-vector extraction.
+# Output: an installable APK on the "stream-latest" release of this repository.
+name: stream-app
+on:
+  push:
+    branches: [main]
+    paths: ['stream/**', '.github/workflows/stream.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: stream-app
+  cancel-in-progress: true
+env:
+  MOMIJI_REPO: https://github.com/yazanj082/momiji.git
+  MOMIJI_COMMIT: 048ae44                      # Momiji 1.1.3, the commit stream/apply.py is written against
+  FFMPEG_TAG: n7.1
+  NDK_VERSION: 26.1.10909125
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+
+      - name: Android NDK and CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${NDK_VERSION}" "cmake;3.22.1" > /dev/null
+          echo "NDK=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Momiji source (pinned)
+        run: |
+          git clone --filter=blob:none "$MOMIJI_REPO" momiji
+          cd momiji && git checkout "$MOMIJI_COMMIT"
+          # every submodule the Android build uses (not the Switch UI or the test framework)
+          git submodule update --init --depth 1 third-party/nanopb third-party/jerasure third-party/gf-complete \
+            third-party/curl third-party/mbedtls third-party/json-c third-party/miniupnp \
+            third-party/cpp-steam-tools android/app/src/main/cpp/oboe
+          git -C third-party/mbedtls submodule update --init --depth 1 || true
+
+      - name: Cache FFmpeg
+        id: ffcache
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-android
+          key: ffmpeg-${{ env.FFMPEG_TAG }}-ndk${{ env.NDK_VERSION }}-h264mv-v1
+
+      - name: FFmpeg for arm64 (H.264 decoder only, static)
+        if: steps.ffcache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$FFMPEG_TAG" https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          cd ffmpeg-src
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          # mpeg1video is here on purpose: FFmpeg only compiles H.264 motion-vector export when an
+          # MPEG-video-family decoder is enabled (CONFIG_MPEGVIDEODEC), otherwise no vectors come out.
+          ./configure --prefix="$GITHUB_WORKSPACE/ffmpeg-android" --target-os=android --arch=aarch64 --enable-cross-compile \
+            --cc="$TC/aarch64-linux-android24-clang" --cxx="$TC/aarch64-linux-android24-clang++" \
+            --ar="$TC/llvm-ar" --ranlib="$TC/llvm-ranlib" --nm="$TC/llvm-nm" --strip="$TC/llvm-strip" \
+            --disable-everything --disable-programs --disable-doc --disable-network --disable-autodetect \
+            --disable-avdevice --disable-avformat --disable-swscale --disable-swresample --disable-avfilter \
+            --enable-decoder=h264 --enable-decoder=mpeg1video --enable-parser=h264 \
+            --enable-static --disable-shared --enable-pic
+          grep -q "CONFIG_MPEGVIDEODEC 1" config.h
+          make -j"$(nproc)" && make install
+
+      - name: Apply Vice City VR changes
+        run: python3 stream/apply.py momiji
+
+      - name: Build APK
+        env:
+          VCVR_FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-android
+        run: |
+          # one fixed debug key, so each new build installs over the previous one
+          mkdir -p ~/.android && cp stream/vcvr-debug.keystore ~/.android/debug.keystore
+          echo "sdk.dir=$ANDROID_HOME" > momiji/android/local.properties
+          cd momiji/android && chmod +x gradlew && ./gradlew --no-daemon assembleFdroidDebug
+          ls -la app/build/outputs/apk/fdroid/debug/
+
+      - name: Publish APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK=$(ls momiji/android/app/build/outputs/apk/fdroid/debug/*.apk | head -1)
+          cp "$APK" vicecityvr-stream.apk
+          sha256sum vicecityvr-stream.apk | tee vicecityvr-stream.apk.sha256
+          gh release delete stream-latest --yes --cleanup-tag || true
+          gh release create stream-latest vicecityvr-stream.apk vicecityvr-stream.apk.sha256 --prerelease \
+            --title "Stream app (build ${GITHUB_RUN_NUMBER})" \
+            --notes "Momiji ${MOMIJI_COMMIT} + motion-vector extraction. Built from ${GITHUB_SHA}."
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs
+          path: |
+            momiji/android/app/.cxx/**/*.log
+            momiji/android/app/build/outputs/logs/**
+          if-no-files-found: ignore
