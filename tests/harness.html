@@ -1,0 +1,210 @@
+<!doctype html><meta charset="utf-8"><title>pipeline harness</title><canvas id="gl" width="1280" height="720"></canvas>
+<script>
+// Runs the app's real shader files on a synthetic scene with known motion, and measures the result.
+const W = 1280, H = 720, FW = 160, FH = 90, DW = 64, DH = 36;
+const gl = document.getElementById('gl').getContext('webgl2', { antialias: false, preserveDrawingBuffer: true });
+gl.getExtension('EXT_color_buffer_float'); gl.getExtension('OES_texture_float_linear');
+const SH = '../app/assets/shaders/';
+const txt = async n => (await fetch(SH + n)).text();
+function prog(vs, fs, name) {
+  const mk = (t, s) => { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o);
+    if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error(name + ': ' + gl.getShaderInfoLog(o)); return o; };
+  const p = gl.createProgram(); gl.attachShader(p, mk(gl.VERTEX_SHADER, vs)); gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(name + ': ' + gl.getProgramInfoLog(p));
+  const u = {}; for (let i = 0; i < gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS); i++) { const n = gl.getActiveUniform(p, i).name; u[n] = gl.getUniformLocation(p, n); }
+  return { p, u };
+}
+function tex(w, h, f16, mip) {
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mip ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  if (f16) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+  else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  if (mip) gl.generateMipmap(gl.TEXTURE_2D);   // allocate every level now: a mip-filtered texture with missing levels samples as black
+  const f = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, f); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  return { t, f, w, h };
+}
+let P = {}, T = {}, model = null, work = { full: 0, used: 0 }, st = { cur: 0, rawCur: 0, stateCur: 0, hasPrev: 0, flowValid: 0, base: 0.01, cuts: 0, dups: 0, frames: 0 };
+const S = { tanV: 0.08 /* synthetic scene = narrow-angle camera: turns shift the picture uniformly */, gateThr: 0.12, sharp: 0.5, deblock: 0.5, horizon: 0.42, nearcap: 0.6, conv: 0.4, hudAuto: 1, skyK: 0.7, rate: 0.12, evK: 1, cut: 0.5 };
+function pass(pr, target, binds, set) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.f : null); gl.viewport(0, 0, target ? target.w : W, target ? target.h : H); gl.useProgram(pr.p);
+  let i = 0; for (const k in binds) { gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_2D, binds[k]); gl.uniform1i(pr.u[k], i++); }
+  if (pr.u.size) gl.uniform2f(pr.u.size, target ? target.w : W, target ? target.h : H);
+  set && set(pr.u); gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+const mip = t => { gl.bindTexture(gl.TEXTURE_2D, t.t); gl.generateMipmap(gl.TEXTURE_2D); };
+async function init() {
+  const vs = await txt('vs.vert');
+  for (const n of ['blit_2d', 'diff', 'enhance', 'flow', 'flowsmooth', 'state', 'main', 'debug']) P[n] = prog(vs, await txt(n + '.frag'), n);
+  gl.bindVertexArray(gl.createVertexArray());
+  T.in = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, T.in); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  T.raw = [tex(W, H), tex(W, H)]; T.src = [tex(W, H, 0, 1), tex(W, H, 0, 1)]; T.diff = tex(DW, DH); T.one = tex(1, 1);
+  T.flow = [tex(FW, FH, 1, 1), tex(FW, FH, 1, 1)]; T.flowS = tex(FW, FH, 1, 1); T.flowP = tex(FW, FH, 1, 1); T.state = [tex(FW, FH, 1), tex(FW, FH, 1)];
+}
+// one captured frame in -> 'dup' | 'cut' | 'frame'
+function newFrame(canvas) {
+  gl.bindTexture(gl.TEXTURE_2D, T.in); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+  const rn = 1 - st.rawCur;
+  pass(P.blit_2d, T.raw[rn], { src: T.in }, u => gl.uniform4f(u.crop, 0, 0, 1, 1));
+  let cut = false;
+  if (st.frames > 0) {
+    pass(P.diff, T.diff, { a: T.raw[rn].t, b: T.raw[st.rawCur].t });
+    const px = new Uint8Array(DW * DH * 4); gl.readPixels(0, 0, DW, DH, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    let sum = 0, changed = 0; for (let i = 0; i < px.length; i += 4) { sum += px[i]; changed += px[i + 1] ? 1 : 0; }
+    const mean = sum / (DW * DH) / 255 / 4, frac = changed / (DW * DH);
+    if (frac < 0.002) { st.dups++; return 'dup'; }
+  }
+  st.rawCur = rn; const n = 1 - st.cur, cur = T.src[n], prev = T.src[st.cur];
+  pass(P.enhance, cur, { raw: T.raw[rn].t }, u => { gl.uniform2f(u.rawSize, W, H); gl.uniform1f(u.sharp, S.sharp); gl.uniform1f(u.deblock, S.deblock); }); mip(cur);
+  if (st.hasPrev) {
+    const fl = (out, init, lod, r, hasInit, gateT) => pass(P.flow, out, { cur: cur.t, prev: prev.t, init: init.t, gateTex: (gateT || init).t }, u => {
+      gl.uniform2f(u.srcSize, W, H); gl.uniform1f(u.lod, lod); gl.uniform1f(u.radius, r); gl.uniform1f(u.hasInit, hasInit);
+      gl.uniform1f(u.gate, gateT ? 1 : 0); gl.uniform1f(u.gateThr, S.gateThr); });
+    const FULL = [[5, 3], [3, 2], [1, 2], [0, 1]], LOCAL = [[1, 2], [0, 1]], cand = r => (2 * r + 1) ** 2;
+    const cells = FW * FH; work.full += cells * FULL.reduce((t, l) => t + cand(l[1]), 0);
+    let res;
+    if (st.flowValid) {                       // predict: start from last frame's motion, search only nearby
+      fl(T.flow[0], T.flowS, 1, 2, 1); fl(T.flow[1], T.flow[0], 0, 1, 1); res = T.flow[1];
+      const F0 = readF(res); let miss = 0; for (let i = 0; i < cells; i++) if (F0[i * 4 + 3] >= S.gateThr) miss++;
+      work.used += cells * LOCAL.reduce((t, l) => t + cand(l[1]), 0) + miss * FULL.reduce((t, l) => t + cand(l[1]), 0);
+      st.missFrac = miss / cells;
+      if (miss) {                               // correct selectively: full search only where the prediction failed
+        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, res.f); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, T.flowP.f);
+        gl.blitFramebuffer(0, 0, FW, FH, 0, 0, FW, FH, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+        let from = null, to = 0;
+        for (const [lod, r] of FULL) { fl(T.flow[to], from === null ? T.flowP : T.flow[from], lod, r, from === null ? 0 : 1, T.flowP); from = to; to = 1 - to; }
+        res = T.flow[from];
+      }
+    } else {
+      let from = null, to = 0;
+      for (const [lod, r] of FULL) { fl(T.flow[to], from === null ? T.flow[1] : T.flow[from], lod, r, from === null ? 0 : 1); from = to; to = 1 - to; }
+      res = T.flow[from]; work.used += cells * FULL.reduce((t, l) => t + cand(l[1]), 0);
+    }
+    mip(res); pass(P.flowsmooth, T.flowS, { flow: res.t }); mip(T.flowS);
+    // a cut is when the previous frame stops explaining this one: the mean match cost jumps
+    pass(P.debug, T.one, { t: T.flowS.t }, u => { gl.uniform4f(u.scale, 0, 0, 0, 1); gl.uniform4f(u.bias, 0, 0, 0, 0); gl.uniform1f(u.lod, 20); });
+    const c1 = new Uint8Array(4); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, c1); const cost = c1[3] / 255; st.lastCost = cost;
+    cut = S.cut > 0 && cost > 0.12 && cost > (7 - 4 * S.cut) * st.base;
+    if (!cut) st.base += (Math.max(cost, 0.004) - st.base) * 0.1; else st.cuts++;
+    model = cut ? null : fitModel(readF(T.flowS), st.frames > 1 ? readF(T.state[st.stateCur]) : null);
+  }
+  const havePair = st.hasPrev && !cut;
+  st.flowValid = havePair ? 1 : 0;
+  const sn = 1 - st.stateCur;
+  pass(P.state, T.state[sn], { src: cur.t, flow: T.flowS.t, prevState: T.state[st.stateCur].t }, u => {
+    gl.uniform1f(u.hasPrev, st.hasPrev); gl.uniform1f(u.cut, havePair ? 0 : 1); gl.uniform1f(u.horizon, S.horizon); gl.uniform1f(u.nearcap, S.nearcap); gl.uniform1f(u.conv, S.conv);
+    gl.uniform1f(u.hudAuto, S.hudAuto); gl.uniform1f(u.skyK, S.skyK); gl.uniform1f(u.rate, S.rate); gl.uniform1f(u.pxw, W);
+    gl.uniform1f(u.tanV, S.tanV); gl.uniform1f(u.aspect, W / H); gl.uniform1f(u.hasModel, model ? 1 : 0);
+    const m = model || [0, 0, 0, 0, 0, 0]; gl.uniform3f(u.rot, m[0], m[1], m[2]); gl.uniform2f(u.side, m[3], m[4]); gl.uniform1f(u.fwd, m[5]); });
+  st.stateCur = sn; st.cur = n; st.hasPrev = 1; st.frames++;
+  return cut ? 'cut' : 'frame';
+}
+// Fit the 6-number camera model to all cells: weighted least squares, then one robust reweighting pass so
+// independently moving things (cars, people) don't drag the camera estimate. Same math goes into the Android app.
+function fitModel(F, Sx) {
+  const sc = [2 * S.tanV * W / H, 2 * S.tanV], rows = [];
+  for (let j = 0; j < FH; j++) for (let i = 0; i < FW; i++) {
+    const k = (j * FW + i) * 4, u = (i + 0.5) / FW, v = (j + 0.5) / FH;
+    const x = (u - 0.5) * sc[0], y = (v - 0.5) * sc[1];
+    const g = Math.min(1, Math.max(0, (v - S.horizon) / (1 - S.horizon)));
+    const r = Sx ? Sx[k] : (v < S.horizon ? 0.1 : 0.1 + 0.8 * g), hud = Sx ? Sx[k + 1] : 0;
+    const w = F[k + 2] / (0.02 + F[k + 3]) * (hud > 0.5 ? 0 : 1);
+    if (w <= 0) continue;
+    rows.push([w, [1 + x * x, x * y, -y, r, 0, r * x], F[k] * sc[0]], [w, [x * y, 1 + y * y, x, 0, r, r * y], F[k + 1] * sc[1]]);
+  }
+  // Iteratively reweighted least squares. Noise scale from the MEDIAN residual: things that disagree with the camera
+  // (unrecognised HUD, cars, people) can't inflate it, so they get down-weighted instead of bending the fit.
+  let th = null;
+  const pred = (a, t) => a[0] * t[0] + a[1] * t[1] + a[2] * t[2] + a[3] * t[3] + a[4] * t[4] + a[5] * t[5];
+  for (let it = 0; it < 4; it++) {
+    const A = Array.from({ length: 6 }, () => new Float64Array(6)), b = new Float64Array(6);
+    let sig2 = 0;
+    if (th) { const e = rows.map(([, a, y]) => Math.abs(y - pred(a, th))).sort((p, q) => p - q); const s = 1.4826 * e[e.length >> 1] + 1e-6; sig2 = s * s; }
+    for (const [w0, a, y] of rows) {
+      let w = w0;
+      if (th) { const e = y - pred(a, th); w *= 1 / (1 + e * e / (4 * sig2)); }
+      for (let p = 0; p < 6; p++) { b[p] += w * a[p] * y; for (let q = 0; q < 6; q++) A[p][q] += w * a[p] * a[q]; }
+    }
+    let tr = 0; for (let p = 0; p < 6; p++) tr += A[p][p]; for (let p = 0; p < 6; p++) A[p][p] += 1e-6 * tr;
+    th = solve(A, b);
+  }
+  return th;
+}
+function solve(A, b) {
+  const n = b.length, M = A.map((r, i) => [...r, b[i]]);
+  for (let c = 0; c < n; c++) {
+    let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    [M[c], M[p]] = [M[p], M[c]];
+    for (let r = 0; r < n; r++) if (r !== c) { const f = M[r][c] / M[c][c]; for (let q = c; q <= n; q++) M[r][q] -= f * M[c][q]; }
+  }
+  return M.map((r, i) => r[n] / r[i]);
+}
+function direct(t) {   // predicted picture t game-frames ahead, no stereo
+  pass(P.main, null, { src: T.src[st.cur].t, stateTex: T.state[st.stateCur].t, flowTex: T.flowS.t }, u => {
+    gl.uniform2f(u.res, W, H); gl.uniform1f(u.sbs, 3); gl.uniform1f(u.bright, 1); gl.uniform1f(u.depthK, 0); gl.uniform1f(u.conv, S.conv); gl.uniform1f(u.flowT, st.flowValid ? t : 0); });
+  const px = new Uint8Array(W * H * 4); gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px); return px;   // row 0 = bottom
+}
+function readF(t) { gl.bindFramebuffer(gl.FRAMEBUFFER, t.f); const b = new Float32Array(t.w * t.h * 4); gl.readPixels(0, 0, t.w, t.h, gl.RGBA, gl.FLOAT, b); return b; }
+const at = (b, x, y, ch) => b[(Math.min(FH - 1, Math.max(0, Math.floor(y / H * FH))) * FW + Math.min(FW - 1, Math.max(0, Math.floor(x / W * FW)))) * 4 + ch];
+
+// ---------------- synthetic scene with known motion ----------------
+const cv = document.createElement('canvas'); cv.width = W; cv.height = H; const c = cv.getContext('2d', { willReadFrequently: true });
+function rnd(seed) { let s = seed >>> 0; return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296); }
+const HZ = 300, POST = [200, 620, 1040], MIDX = 460, FARX = 760;
+function strip(x0, y0, w, h, seed, hue) { const r = rnd(seed); for (let y = y0; y < y0 + h; y += 12) for (let x = x0; x < x0 + w; x += 12) { c.fillStyle = `hsl(${hue + r() * 40},${30 + r() * 40}%,${20 + r() * 55}%)`; c.fillRect(x, y, 12, 12); } }
+function scene(X, R, seed = 1) {   // X: sideways camera travel (px at depth 1), R: camera turn (px)
+  const g = c.createLinearGradient(0, 0, 0, HZ); g.addColorStop(0, '#3d7ad8'); g.addColorStop(1, '#bcd6f2'); c.fillStyle = g; c.fillRect(0, 0, W, HZ);
+  c.fillStyle = '#5c6b4a'; c.fillRect(0, HZ, W, H - HZ);
+  const wrap = (x, w) => ((x % (W + w)) + (W + w)) % (W + w) - w;
+  for (let k = -1; k < 4; k++) strip(Math.round(0) + wrap(FARX + k * 430 + X / 8 + R, 300) , 170, 300, 135, seed * 100 + ((k + 9) % 5), 200);   // far, depth 8
+  for (let y = HZ; y < H; y += 6) { const Z = 1.05 * (H - HZ) / (y - HZ + 4); const r = rnd(seed * 7 + y); const sh = X / Z + R;                 // ground rows
+    for (let k = 0; k < 14; k++) { const x = wrap(r() * (W + 60) + sh, 60); c.fillStyle = r() > 0.5 ? '#3b3d42' : '#8a8f6a'; c.fillRect(x, y, 30 + r() * 30, 6); } }
+  for (let k = -1; k < 3; k++) strip(wrap(MIDX + k * 640 + X / 3 + R, 240), 120, 240, 250, seed * 50 + ((k + 9) % 4), 20);                          // mid, depth 3
+  for (const px of POST) strip(wrap(px + X + R, 70), 80, 70, 560, seed * 10 + px, 120);                                                          // near posts, depth 1
+  // screen-locked HUD
+  c.fillStyle = 'rgba(10,10,10,.9)'; c.beginPath(); c.arc(110, 620, 80, 0, 7); c.fill(); c.strokeStyle = '#ddd'; c.lineWidth = 4; c.stroke();
+  c.fillStyle = '#4fd1ff'; c.beginPath(); c.moveTo(110, 590); c.lineTo(90, 640); c.lineTo(130, 640); c.fill();
+  c.fillStyle = '#7ef07e'; c.font = 'bold 40px sans-serif'; c.textAlign = 'right'; c.fillText('$1,250,000', 1250, 60);
+  return { post: POST.map(p => wrap(p + X + R, 70) + 35), mid: [0, 1].map(k => wrap(MIDX + k * 640 + X / 3 + R, 240) + 120), far: [0, 1, 2].map(k => wrap(FARX + k * 430 + X / 8 + R, 300) + 150) };
+}
+function truth(X, R, seed) { scene(X, R, seed); return c.getImageData(0, 0, W, H).data; }   // row 0 = top
+function mae(glpx, top) { let s = 0, n = 0; for (let y = 0; y < H; y += 2) for (let x = 0; x < W; x += 2) { const a = ((H - 1 - y) * W + x) * 4, b = (y * W + x) * 4; s += Math.abs(glpx[a] - top[b]) + Math.abs(glpx[a + 1] - top[b + 1]) + Math.abs(glpx[a + 2] - top[b + 2]); n += 3; } return s / n; }
+const inside = (xs, lo, hi) => xs.find(x => x > lo && x < hi);
+// a point inside one of the objects (centres xs, half-width half) that no near post (70 px wide) covers
+const clear = (xs, posts, half) => { for (const x0 of xs) for (let d = 0; d <= half - 15; d += 5) for (const x of [x0 - d, x0 + d]) if (x > 150 && x < 1130 && posts.every(p => Math.abs(p - x) > 60)) return x; throw new Error('no clear sample point'); };
+
+window.run = async function () {
+  await init(); const R = {}; let X = 0, Rot = 0, pos;
+  // phase A: 40 frames of sideways travel, 6 px/frame at depth 1
+  for (let i = 0; i < 40; i++) { X += 6; pos = scene(X, Rot); newFrame(cv); }
+  let F = readF(T.flowS), Sx = readF(T.state[st.stateCur]);
+  const px = v => v * W;
+  const pN = inside(pos.post, 300, 1000), pM = clear(pos.mid, pos.post, 120), pF = clear(pos.far, pos.post, 150);
+  R.flow_near = [px(at(F, pN, 200, 0)), px(at(F, pN, 200, 1))]; R.flow_mid = [px(at(F, pM, 150, 0)), px(at(F, pM, 150, 1))];
+  R.flow_far = [px(at(F, pF, 185, 0)), px(at(F, pF, 185, 1))]; R.flow_hud = [px(at(F, 110, 620, 0)), px(at(F, 110, 620, 1))];
+  R.resp_near = at(Sx, pN, 200, 0); R.resp_mid = at(Sx, pM, 150, 0); R.resp_far = at(Sx, pF, 185, 0); R.resp_sky = at(Sx, 900, 60, 0);
+  let hmax = 0; for (let y = 545; y < 700; y += 4) for (let x = 30; x < 190; x += 4) hmax = Math.max(hmax, at(Sx, x, y, 1));
+  R.hud_during_travel_world = Math.max(at(Sx, pM, 150, 1), at(Sx, pN, 200, 1), at(Sx, pF, 185, 1));
+  R.evidence_translate = at(Sx, 640, 360, 2); R.model_travel = model; R.miss_frac_travel = st.missFrac;
+  // frame generation: predict half a game frame ahead, compare with the true picture at that time
+  const gt = truth(X + 3, Rot).slice(); scene(X, Rot);
+  R.err_hold = mae(direct(0), gt); R.err_predict = mae(direct(0.5), gt);
+  const gtFull = truth(X + 6, Rot).slice(); scene(X, Rot); R.err_hold_full = mae(direct(0), gtFull); R.err_predict_full = mae(direct(1), gtFull);
+  // duplicate frame
+  R.dup = newFrame(cv);
+  // phase B: turning only, 10 px/frame
+  for (let i = 0; i < 20; i++) { Rot += 10; pos = scene(X, Rot); newFrame(cv); }
+  F = readF(T.flowS); Sx = readF(T.state[st.stateCur]);
+  const qM = clear(pos.mid, pos.post, 120), qF = clear(pos.far, pos.post, 150); R.far_x_after_turn = qF;
+  hmax = 0; for (let y = 545; y < 700; y += 4) for (let x = 30; x < 190; x += 4) hmax = Math.max(hmax, at(Sx, x, y, 1));
+  R.hud_minimap_max = hmax; R.hud_world = Math.max(at(Sx, qM, 150, 1), at(Sx, inside(pos.post, 300, 1000), 200, 1), at(Sx, clear(pos.far, pos.post, 90), 185, 1));
+  R.resp_after_turn = [at(Sx, inside(pos.post, 300, 1000) || pos.post[1], 200, 0), at(Sx, qM, 150, 0), at(Sx, qF, 185, 0)];
+  R.turn_flow_mid = [px(at(F, qM, 150, 0)), px(at(F, qM, 150, 1))]; R.turn_flow_ground = px(at(F, 700, 640, 0)); R.evidence_turn = at(Sx, 640, 360, 2); R.miss_frac_turn = st.missFrac;
+  const gtT = truth(X, Rot + 5).slice(); scene(X, Rot); R.turn_err_hold = mae(direct(0), gtT); R.turn_err_predict = mae(direct(0.5), gtT);
+  // cut to a different view
+  R.cost_before_cut = st.lastCost; R.base_before_cut = st.base; c.save(); c.filter = 'hue-rotate(140deg) brightness(0.6)'; c.translate(W, H); c.scale(-1, -1); scene(X + 4000, Rot + 777, 9); c.restore(); R.cut = newFrame(cv); R.cost_at_cut = st.lastCost; R.flowValid_after_cut = st.flowValid;
+  Sx = readF(T.state[st.stateCur]); hmax = 0; for (let y = 545; y < 700; y += 4) for (let x = 30; x < 190; x += 4) hmax = Math.max(hmax, at(Sx, x, y, 1)); R.hud_survives_cut = hmax;
+  R.cuts = st.cuts; R.dups = st.dups; R.err = gl.getError(); R.search_work_saved = 1 - work.used / work.full; R.model_turn = model;
+  return R;
+};
+</script>
