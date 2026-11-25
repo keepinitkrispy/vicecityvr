@@ -13,7 +13,7 @@ package cal.psvr;
 //   Square  fine / coarse steps           Cross  save                      Triangle  reset this eye
 //   Options next pattern                  Create swap eyes                 R3  lens correction on/off
 //   L3      send VR mode again            Circle  exit
-// Touch on the phone screen: drag moves the eye on the side you touched; lift saves.
+// Touch: use the phone-only buttons for every controller action; drag either preview eye to adjust, then Save.
 
 import android.app.Activity;
 import android.app.PendingIntent;
@@ -46,6 +46,10 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -64,6 +68,7 @@ public class Main extends Activity implements DisplayManager.DisplayListener {
     String usbState = "headset: not found";
 
     Panel phone, headset; Presentation pres; DisplayManager dm; SharedPreferences prefs;
+    TextView phoneStatus; Button eyeLeft, eyeRight, stepButton, patternButton, swapButton, warpButton, saveButton;
     Bitmap[] eyeImg = new Bitmap[2]; int imgPattern = -1;
     final Handler ui = new Handler(Looper.getMainLooper());
 
@@ -72,7 +77,7 @@ public class Main extends Activity implements DisplayManager.DisplayListener {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         immersive(getWindow());
         prefs = getSharedPreferences("cal", 0); load();
-        phone = new Panel(this, true); setContentView(phone);
+        phone = new Panel(this, true); setContentView(buildPhoneControls());
         dm = (DisplayManager) getSystemService(DISPLAY_SERVICE);
         dm.registerDisplayListener(this, ui);
         attachHeadsetDisplay();
@@ -84,6 +89,71 @@ public class Main extends Activity implements DisplayManager.DisplayListener {
     }
 
     @Override protected void onDestroy() { super.onDestroy(); try { unregisterReceiver(usbReceiver); } catch (Exception e) {} dm.unregisterDisplayListener(this); }
+
+    // All touch controls are on the phone only; the external presentation stays clean.
+    LinearLayout buildPhoneControls() {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.HORIZONTAL);
+        root.setBackgroundColor(Color.BLACK);
+        root.addView(phone, new LinearLayout.LayoutParams(0, -1, 0.54f));
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        root.addView(scroll, new LinearLayout.LayoutParams(0, -1, 0.46f));
+        LinearLayout controls = new LinearLayout(this);
+        controls.setOrientation(LinearLayout.VERTICAL);
+        int pad = Math.round(6 * getResources().getDisplayMetrics().density);
+        controls.setPadding(pad, pad, pad, pad);
+        scroll.addView(controls);
+        phoneStatus = new TextView(this);
+        phoneStatus.setTextColor(Color.WHITE);
+        phoneStatus.setTextSize(13);
+        controls.addView(phoneStatus);
+        LinearLayout row = controlRow(controls);
+        eyeLeft = control(row, "Left eye", () -> { eye = 0; redraw(); });
+        eyeRight = control(row, "Right eye", () -> { eye = 1; redraw(); });
+        stepButton = control(row, "Fine", () -> { step = step == 2f ? 10f : 2f; redraw(); });
+        row = controlRow(controls);
+        control(row, "Left", () -> move(-step, 0));
+        control(row, "Up", () -> move(0, -step));
+        control(row, "Right", () -> move(step, 0));
+        row = controlRow(controls);
+        control(row, "Smaller", () -> zoom(step > 2 ? 0.98f : 0.996f));
+        control(row, "Down", () -> move(0, step));
+        control(row, "Larger", () -> zoom(step > 2 ? 1.02f : 1.004f));
+        row = controlRow(controls);
+        control(row, "Reset eye", () -> { ox[eye] = oy[eye] = 0; sc[eye] = 1; saved = false; redraw(); });
+        patternButton = control(row, "Pattern", () -> { pattern = (pattern + 1) % PATTERNS.length; redraw(); });
+        swapButton = control(row, "Swap eyes", () -> { swap = !swap; saved = false; redraw(); });
+        row = controlRow(controls);
+        warpButton = control(row, "Lens off", () -> { warp = !warp; saved = false; redraw(); });
+        control(row, "Retry USB", () -> findHeadset(true));
+        saveButton = control(row, "Save", this::save);
+        row = controlRow(controls);
+        control(row, "Reload saved", () -> { load(); saved = true; redraw(); });
+        control(row, "Exit", this::finish);
+        redraw();
+        return root;
+    }
+
+    LinearLayout controlRow(LinearLayout parent) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        parent.addView(row, new LinearLayout.LayoutParams(-1, -2));
+        return row;
+    }
+
+    Button control(LinearLayout row, String label, Runnable action) {
+        Button b = new Button(this);
+        b.setText(label);
+        b.setAllCaps(false);
+        b.setTextSize(13);
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
+        b.setPadding(4, 0, 4, 0);
+        b.setOnClickListener(v -> action.run());
+        row.addView(b, new LinearLayout.LayoutParams(0, -2, 1f));
+        return b;
+    }
 
     static void immersive(Window w) {
         w.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN
@@ -116,7 +186,7 @@ public class Main extends Activity implements DisplayManager.DisplayListener {
             if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(i.getAction())) { findHeadset(true); return; }
             UsbDevice d = i.getParcelableExtra(UsbManager.EXTRA_DEVICE);
             if (d != null && i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) startVr(d);
-            else status("headset: USB permission denied (press L3 to ask again)");
+            else status("headset: USB permission denied (tap Retry USB or press L3)");
         }
     };
 
@@ -213,7 +283,22 @@ public class Main extends Activity implements DisplayManager.DisplayListener {
     }
     void zoom(float f) { sc[eye] = clamp(sc[eye] * f, 0.5f, 1.6f); saved = false; redraw(); }
     static float clamp(float v, float a, float b) { return Math.max(a, Math.min(b, v)); }
-    void redraw() { if (phone != null) phone.invalidate(); if (headset != null) headset.invalidate(); }
+    void redraw() {
+        if (phone != null) phone.invalidate();
+        if (headset != null) headset.invalidate();
+        if (phoneStatus != null) {
+            phoneStatus.setText(usbState + (headset == null ? "\nNo headset display" : "") +
+                String.format(Locale.US, "\n%s | %s eye | X %.0f Y %.0f Size %.3f | %s",
+                PATTERNS[pattern], eye == 0 ? "LEFT" : "RIGHT", ox[eye], oy[eye], sc[eye], saved ? "SAVED" : "UNSAVED"));
+            eyeLeft.setText(eye == 0 ? "Left ✓" : "Left eye");
+            eyeRight.setText(eye == 1 ? "Right ✓" : "Right eye");
+            stepButton.setText(step > 2 ? "Coarse" : "Fine");
+            patternButton.setText("Next pattern");
+            swapButton.setText(swap ? "Swap on" : "Swap off");
+            warpButton.setText(warp ? "Lens on" : "Lens off");
+            saveButton.setText(saved ? "Saved ✓" : "Save");
+        }
+    }
 
     // ------------------------------------------------------------------ input
     @Override public boolean dispatchKeyEvent(KeyEvent k) {
@@ -324,16 +409,10 @@ public class Main extends Activity implements DisplayManager.DisplayListener {
                 c.restore();
             }
             c.restore();
-            if (controls) {
-                q.setColor(Color.WHITE); q.setTextSize(Math.max(26, getHeight() / 30f));
-                float y = q.getTextSize() * 1.4f, dy = q.getTextSize() * 1.3f;
-                c.drawText(usbState + (headset == null ? "   |   no headset display: showing here" : ""), 24, y, q);
-                c.drawText(String.format(Locale.US, "Pattern %s   Editing %s eye   X %.0f  Y %.0f  scale %.3f   step %s   swap %s   lens %s%s",
-                    PATTERNS[pattern], eye == 0 ? "LEFT" : "RIGHT", ox[eye], oy[eye], sc[eye], step > 2 ? "coarse" : "fine",
-                    swap ? "ON" : "off", warp ? "ON" : "off", saved ? "   SAVED" : "   (not saved)"), 24, y + dy, q);
-                c.drawText("L1/R1 eye  D-pad move  L2/R2 size  Square step  Cross save  Triangle reset  Options pattern  Create swap  R3 lens  L3 VR mode", 24, getHeight() - dy, q);
-            }
+
         }
+
+        @Override public boolean performClick() { super.performClick(); return true; }
 
         @Override public boolean onTouchEvent(MotionEvent e) {
             if (!controls) return true;
@@ -341,7 +420,8 @@ public class Main extends Activity implements DisplayManager.DisplayListener {
             switch (e.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN: px = e.getX(); py = e.getY(); int half = px < getWidth() / 2f ? 0 : 1; eye = swap ? 1 - half : half; redraw(); return true;
                 case MotionEvent.ACTION_MOVE: move((e.getX() - px) / s, (e.getY() - py) / s); px = e.getX(); py = e.getY(); return true;
-                case MotionEvent.ACTION_UP: save(); return true;
+                case MotionEvent.ACTION_UP: performClick(); return true;
+                case MotionEvent.ACTION_CANCEL: return true;
             }
             return true;
         }
