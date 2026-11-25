@@ -21,8 +21,14 @@ def test_parse():
     assert P.parse_status(st) == {'power': 1, 'worn': 1, 'cinematic': 0, 'volume': 30, 'vr': 1}
 
 def test_endpoints():
-    d = open('/tmp/fakedesc.bin', 'rb').read() if os.path.exists('/tmp/fakedesc.bin') else None
-    if d: assert P.parse_endpoints(d) == {4: {'in': 0x83}, 5: {'in': 0x84, 'out': 0x04}}
+    # synthetic PSVR descriptor: interface 4 (IN 0x83), interface 5 (IN 0x84, OUT 0x04)
+    dev = bytes([18, 1, 0, 2, 0, 0, 0, 64]) + struct.pack('<HHH', 0x054c, 0x09af, 0x100) + bytes([1, 2, 3, 1])
+    ifs = b''
+    for num, eps in [(4, [0x83]), (5, [0x84, 0x04])]:
+        ifs += bytes([9, 4, num, 0, len(eps), 3, 0, 0, 0]) + bytes([9, 0x21, 0x11, 1, 0, 1, 0x22, 40, 0])
+        for e in eps: ifs += bytes([7, 5, e, 3, 64, 0, 1])
+    cfg = bytes([9, 2]) + struct.pack('<H', 9 + len(ifs)) + bytes([2, 1, 0, 0x80, 250]) + ifs
+    assert P.parse_endpoints(dev + cfg) == {4: {'in': 0x83}, 5: {'in': 0x84, 'out': 0x04}}
 
 def angle(q):  # rotation angle of quaternion
     return 2 * math.acos(min(1, abs(q[0])))
@@ -79,7 +85,9 @@ def test_server():
     assert len(pose['q']) == 4 and pose['cal'] is True
 
 if __name__ == '__main__':
-    os.environ['HOME'] = '/tmp/psvrtest'; P.STATE = '/tmp/psvrtest/.config/psvr-control'
+    import tempfile
+    tmp = os.path.join(tempfile.gettempdir(), 'psvrtest')      # Termux has no /tmp
+    os.environ['HOME'] = tmp; P.STATE = os.path.join(tmp, '.config', 'psvr-control')
     for name, fn in list(globals().items()):
         if name.startswith('test_'):
             try: fn(); print('PASS', name)
