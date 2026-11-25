@@ -1,0 +1,710 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>PSVR Stereo Renderer</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font: 14px/1.35 system-ui, sans-serif; color: #e8e8e8; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; touch-action: none; }
+  #panel { position: fixed; top: 8px; left: 8px; bottom: 8px; width: min(420px, calc(100vw - 16px)); overflow-y: auto;
+           background: rgba(18,20,24,.92); border: 1px solid #333; border-radius: 10px; padding: 10px 12px; box-sizing: border-box; }
+  #panel.hidden { display: none; }
+  h1 { font-size: 16px; margin: 0 0 6px; }
+  h2 { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: #8fb3ff; margin: 14px 0 4px; }
+  .row { display: grid; grid-template-columns: 1fr 64px; gap: 2px 8px; align-items: center; margin: 4px 0; }
+  .row label { grid-column: 1 / 3; font-size: 12px; color: #bbb; }
+  .row input[type=range] { width: 100%; }
+  .row output { font-variant-numeric: tabular-nums; text-align: right; font-size: 12px; }
+  button, select, input[type=text] { font: inherit; background: #2a2f38; color: #eee; border: 1px solid #444; border-radius: 6px; padding: 6px 9px; margin: 2px 2px 2px 0; }
+  button.primary { background: #2f5fd0; border-color: #2f5fd0; }
+  input[type=text] { width: 100%; box-sizing: border-box; }
+  #status { font-size: 12px; color: #9c9; white-space: pre-wrap; margin-top: 6px; }
+  .hint { font-size: 12px; color: #999; }
+  video, img#mjpeg { display: none; }
+  [hidden] { display: none !important; }
+</style>
+<canvas id="c"></canvas>
+<div id="panel">
+  <h1>PSVR Stereo Renderer</h1>
+  <div class="hint">Double-tap the screen or press H to show/hide this panel. Mute button on the headset cable recenters; volume buttons change 3D strength.</div>
+  <h2>Source</h2>
+  <select id="srcSel">
+    <option value="testfp">Test scene: first-person (HUD, gun, look-back)</option>
+    <option value="test">Test scene: third-person driving</option>
+    <option value="url">MJPEG stream URL (Remote Play via ScreenStream)</option>
+    <option value="camera">Capture card / camera</option>
+    <option value="file">Video file</option>
+  </select>
+  <div id="urlBox" style="display:none"><input type="text" id="srcUrl" placeholder="http://192.168.x.x:8080/stream.mjpeg"><button id="urlGo">Connect</button></div>
+  <div id="camBox" style="display:none"><select id="camSel"></select><button id="camGo">Open</button></div>
+  <div id="fileBox" style="display:none"><input type="file" id="srcFile" accept="video/*"></div>
+  <h2>Go</h2>
+  <button class="primary" id="startBtn">Start (fullscreen)</button>
+  <button id="recenterBtn">Recenter</button>
+  <button data-preset="theater">Theater</button><button data-preset="cockpit">Cockpit</button><button data-preset="imax">IMAX</button>
+  <h2 id="hdHead">Headset (needs psvrd)</h2>
+  <button data-usb="vr">VR mode</button><button data-usb="cinematic">Cinematic</button><button data-usb="power_off">Headset off</button><button id="recalBtn">Recalibrate IMU</button>
+  <div id="sliders"></div>
+  <h2>Reset</h2>
+  <button id="resetBtn">Reset all settings</button>
+  <div id="status"></div>
+</div>
+<video id="vid" playsinline muted autoplay loop></video>
+<img id="mjpeg" alt="">
+<script>
+// Shared settings schema for the renderer (index.html) and the remote control page (control.html).
+// [key, label, min, max, step, default, group]
+window.SCHEMA = [
+  ['depth',   '3D strength (0 = identical image to both eyes)', 0, 2.5, 0.05, 1.0, 'Depth'],
+  ['profile', 'Game camera: 0 third-person · 1 first-person · 2 generic', 0, 2, 1, 1, 'Depth'],
+  ['horizon', 'Horizon height (ground-plane disparity)', 0.15, 0.85, 0.01, 0.45, 'Depth'],
+  ['nearcap', 'Max pop-out (hands / gun / car bonnet)', 0, 1, 0.05, 0.6, 'Depth'],
+  ['hudauto', 'Auto-flatten screen-locked HUD', 0, 1, 1, 1, 'Depth'],
+  ['cut',     'Cut detection (R3 look-back, camera switch)', 0, 1, 0.05, 0.5, 'Depth'],
+  ['conv',    'Screen plane (0 = all pops out, 1 = all sinks in)', 0, 1, 0.05, 0.4, 'Depth'],
+  ['sky',     'Push sky / distance back',    0,    1,    0.05, 0.7,  'Depth'],
+  ['subject', 'Pop the player/car forward',  0,    1,    0.05, 0.5,  'Depth'],
+  ['smooth',  'Depth smoothing (anti-shimmer)', 0, 0.97, 0.01, 0.85, 'Depth'],
+  ['hud',     'Also flatten HUD corners (fixed mask)', 0, 1, 1, 0, 'Depth'],
+  ['ml',      'AI depth blend (phone model, optional)', 0, 1, 0.05, 0, 'Depth'],
+
+  ['dist',    'Screen distance (m)',         0.8,  8,    0.1,  2.6,  'Screen'],
+  ['width',   'Screen width (degrees)',      30,   150,  1,    84,   'Screen'],
+  ['curve',   'Curvature',                   0.02, 1,    0.02, 0.6,  'Screen'],
+  ['follow',  'Screen follows your head',    0,    1,    0.05, 0.0,  'Screen'],
+  ['ambient', 'Peripheral glow (vection)',   0,    1,    0.05, 0.55, 'Screen'],
+  ['floor',   'Floor / room grounding',      0,    1,    0.05, 0.3,  'Screen'],
+  ['bright',  'Brightness',                  0.5,  1.6,  0.01, 1.0,  'Screen'],
+
+  ['warp',    'Lens correction on',          0,    1,    1,    1,    'Lens'],
+  ['swap',    'Swap eyes',                   0,    1,    1,    0,    'Lens'],
+  ['fov',     'Lens FOV scale',              0.4,  1.3,  0.01, 0.8,  'Lens'],
+  ['k1',      'Lens K1',                     0,    0.7,  0.01, 0.22, 'Lens'],
+  ['k2',      'Lens K2',                     0,    0.7,  0.01, 0.24, 'Lens'],
+  ['ca',      'Colour fringe fix',           0,    0.05, 0.001,0.012,'Lens'],
+  ['ipd',     'IPD (mm)',                    54,   76,   0.5,  63,   'Lens'],
+  ['lensx',   'Lens centre X',               -0.2, 0.2,  0.005,0,    'Lens'],
+  ['lensy',   'Lens centre Y',               -0.2, 0.2,  0.005,0,    'Lens'],
+  ['fill16',  'HDMI is 16:9 (mirror letterbox fix)', 0, 1, 1, 1,   'Lens'],
+  ['grid',    'Calibration grid',            0,    1,    1,    0,    'Lens'],
+  ['lxo',     'Left eye X (px)',             -440, 440,  1,    0,    'Per-eye (from PSVR Alignment app)'],
+  ['lyo',     'Left eye Y (px)',             -490, 490,  1,    0,    'Per-eye (from PSVR Alignment app)'],
+  ['lsc',     'Left eye scale',              0.5,  1.6,  0.001,1,    'Per-eye (from PSVR Alignment app)'],
+  ['rxo',     'Right eye X (px)',            -440, 440,  1,    0,    'Per-eye (from PSVR Alignment app)'],
+  ['ryo',     'Right eye Y (px)',            -490, 490,  1,    0,    'Per-eye (from PSVR Alignment app)'],
+  ['rsc',     'Right eye scale',             0.5,  1.6,  0.001,1,    'Per-eye (from PSVR Alignment app)'],
+
+  ['predict', 'Head prediction (ms)',        0,    60,   1,    22,   'Tracking'],
+  ['neck',    'Neck model',                  0,    1,    1,    1,    'Tracking'],
+  ['invyaw',  'Invert yaw',                  0,    1,    1,    0,    'Tracking'],
+  ['invpitch','Invert pitch',                0,    1,    1,    0,    'Tracking'],
+  ['invroll', 'Invert roll',                 0,    1,    1,    0,    'Tracking'],
+  ['sbs',     'Output: 0 flat · 1 PSVR headset · 2 cross-eye 3D', 0, 2, 1, 1, 'Tracking'],
+];
+window.PRESETS = {
+  theater: { dist: 3.2, width: 70, curve: 0.4, follow: 0.0, ambient: 0.45, floor: 0.35 },
+  cockpit: { dist: 1.7, width: 108, curve: 0.9, follow: 0.35, ambient: 0.7, floor: 0.15 },
+  imax:    { dist: 5.0, width: 125, curve: 1.0, follow: 0.0, ambient: 0.8, floor: 0.2 },
+};
+</script>
+<script>
+'use strict';
+// ------------------------------------------------------------------ settings
+const LOCAL = location.port === '8765' || new URLSearchParams(location.search).has('ws');
+const lsGet = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
+const LS_KEY = 'psvr3d.settings.v3';
+const DEF = {}; SCHEMA.forEach(s => DEF[s[0]] = s[5]);
+if (!LOCAL) DEF.sbs = 2; // standalone link: cross-eye 3D you can check on any screen
+let S = Object.assign({}, DEF);
+try { Object.assign(S, JSON.parse(lsGet(LS_KEY) || '{}')); } catch (e) {}
+function save() { lsSet(LS_KEY, JSON.stringify(S)); }
+const sliderEls = {};
+(function buildSliders() {
+  const box = document.getElementById('sliders'); let group = '';
+  for (const [k, label, mn, mx, st, , g] of SCHEMA) {
+    if (g !== group) { group = g; const h = document.createElement('h2'); h.textContent = g; box.appendChild(h); }
+    const row = document.createElement('div'); row.className = 'row';
+    row.innerHTML = `<label for="s_${k}">${label}</label><input type="range" id="s_${k}" min="${mn}" max="${mx}" step="${st}"><output></output>`;
+    const inp = row.querySelector('input'), out = row.querySelector('output');
+    inp.value = S[k]; out.textContent = (+S[k]).toFixed(st < 1 ? (st < 0.01 ? 3 : 2) : 0);
+    inp.addEventListener('input', () => { setKey(k, +inp.value, true); });
+    sliderEls[k] = [inp, out, st];
+    box.appendChild(row);
+  }
+})();
+function setKey(k, v, fromUI) {
+  if (!(k in DEF)) return;
+  const sch = SCHEMA.find(s => s[0] === k); v = Math.min(sch[3], Math.max(sch[2], v));
+  S[k] = v; save();
+  const [inp, out, st] = sliderEls[k];
+  if (!fromUI) inp.value = v;
+  out.textContent = (+v).toFixed(st < 1 ? (st < 0.01 ? 3 : 2) : 0);
+  if (fromUI) wsSend({ type: 'set', key: k, value: v });
+}
+function applyPreset(name) { const p = PRESETS[name]; if (!p) return; for (const k in p) setKey(k, p[k]); wsSend({ type: 'settings', S }); }
+document.querySelectorAll('[data-preset]').forEach(b => b.onclick = () => applyPreset(b.dataset.preset));
+document.getElementById('resetBtn').onclick = () => { for (const k in DEF) setKey(k, DEF[k]); wsSend({ type: 'settings', S }); };
+
+// ------------------------------------------------------------------ status
+const statusEl = document.getElementById('status');
+const st = { ws: 'off', imu: '-', src: '-', fps: 0, ml: 'off', usb: '-', cal: 'defaults', cuts: 0 };
+function showStatus() { statusEl.textContent = `tracking: ${st.ws}  imu: ${st.imu}  headset: ${st.usb}\nsource: ${st.src}\nrender: ${st.fps} fps   ai-depth: ${st.ml}\ncalibration: ${st.cal}   cuts seen: ${st.cuts}`; }
+setInterval(showStatus, 500);
+
+// ------------------------------------------------------------------ websocket to psvrd
+let ws = null, pose = null, poseT = 0;
+function wsSend(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
+function wsConnect() {
+  const qp = new URLSearchParams(location.search).get('ws');
+  const url = qp || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  if (!qp && !location.host) { st.ws = 'n/a (open via psvrd)'; return; }
+  try { ws = new WebSocket(url); } catch (e) { st.ws = 'error'; return; }
+  ws.onopen = () => { st.ws = 'connected'; wsSend({ type: 'settings', S }); };
+  ws.onclose = () => { st.ws = 'reconnecting'; pose = null; setTimeout(wsConnect, 2000); };
+  ws.onerror = () => {};
+  ws.onmessage = ev => {
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.type === 'pose') { pose = m; poseT = performance.now(); st.imu = m.cal ? 'ok' : 'calibrating (keep still)'; st.usb = m.status; }
+    else if (m.type === 'recenter') recenter();
+    else if (m.type === 'nudge') setKey(m.key, S[m.key] + m.delta);
+    else if (m.type === 'set') setKey(m.key, m.value);
+    else if (m.type === 'preset') applyPreset(m.name);
+    else if (m.type === 'hello') wsSend({ type: 'settings', S });
+  };
+}
+if (LOCAL) wsConnect(); else st.ws = 'off (run psvrd on the Pixel for head tracking)';
+// per-eye calibration saved by the PSVR Alignment app (it POSTs to psvrd); same units and lens model
+if (LOCAL) fetch('/calibration.json').then(r => r.json()).then(c => {
+  if (!c || !c.eyes) return;
+  const [L, R] = c.eyes;
+  setKey('lxo', L.x); setKey('lyo', L.y); setKey('lsc', L.scale); setKey('rxo', R.x); setKey('ryo', R.y); setKey('rsc', R.scale);
+  setKey('swap', c.swap ? 1 : 0); setKey('warp', c.warp ? 1 : 0);
+  if (c.k1 != null) setKey('k1', c.k1); if (c.k2 != null) setKey('k2', c.k2);
+  st.cal = 'loaded from alignment app';
+}).catch(() => {});
+document.querySelectorAll('[data-usb]').forEach(b => b.onclick = () => wsSend({ type: 'usb', cmd: b.dataset.usb }));
+document.getElementById('recalBtn').onclick = () => wsSend({ type: 'recal' });
+
+// ------------------------------------------------------------------ quaternions
+const qmul = (a, b) => [a[0]*b[0]-a[1]*b[1]-a[2]*b[2]-a[3]*b[3], a[0]*b[1]+a[1]*b[0]+a[2]*b[3]-a[3]*b[2],
+                        a[0]*b[2]-a[1]*b[3]+a[2]*b[0]+a[3]*b[1], a[0]*b[3]+a[1]*b[2]-a[2]*b[1]+a[3]*b[0]];
+const qn = q => { const n = Math.hypot(...q) || 1; return q.map(c => c / n); };
+const qaxis = (x, y, z, ang) => [Math.cos(ang/2), x*Math.sin(ang/2), y*Math.sin(ang/2), z*Math.sin(ang/2)];
+function qmat(q) { // column-major mat3, body -> world
+  const [w, x, y, z] = q;
+  return [1-2*(y*y+z*z), 2*(x*y+w*z), 2*(x*z-w*y),
+          2*(x*y-w*z), 1-2*(x*x+z*z), 2*(y*z+w*x),
+          2*(x*z+w*y), 2*(y*z-w*x), 1-2*(x*x+y*y)];
+}
+const mulMV = (m, v) => [m[0]*v[0]+m[3]*v[1]+m[6]*v[2], m[1]*v[0]+m[4]*v[1]+m[7]*v[2], m[2]*v[0]+m[5]*v[1]+m[8]*v[2]];
+const yawOf = q => { const m = qmat(q); return Math.atan2(m[6], m[8]); }; // forward = -col2
+let recenterQ = [1, 0, 0, 0], lastRawQ = [1, 0, 0, 0];
+function recenter() { recenterQ = qaxis(0, 1, 0, -yawOf(lastRawQ)); screenYaw = 0; }
+document.getElementById('recenterBtn').onclick = recenter;
+
+// mouse / touch-drag look (for testing without the headset)
+let dragYaw = 0, dragPitch = 0, dragging = null;
+const cvs = document.getElementById('c');
+cvs.addEventListener('pointerdown', e => { dragging = [e.clientX, e.clientY]; });
+addEventListener('pointerup', () => dragging = null);
+addEventListener('pointermove', e => { if (!dragging) return;
+  dragYaw += (e.clientX - dragging[0]) * 0.004; dragPitch = Math.max(-1.4, Math.min(1.4, dragPitch + (e.clientY - dragging[1]) * 0.004));
+  dragging = [e.clientX, e.clientY]; });
+let lastTap = 0;
+cvs.addEventListener('pointerup', () => { const t = performance.now(); if (t - lastTap < 300) togglePanel(); lastTap = t; });
+const panel = document.getElementById('panel');
+function togglePanel() { panel.classList.toggle('hidden'); }
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  if (e.key === 'h' || e.key === 'H') togglePanel();
+  else if (e.key === 'r' || e.key === 'R') recenter();
+  else if (e.key === 'f' || e.key === 'F') goFullscreen();
+  else if (e.key === ']') setKey('depth', S.depth + 0.1, true);
+  else if (e.key === '[') setKey('depth', S.depth - 0.1, true);
+});
+async function goFullscreen() {
+  try { await document.documentElement.requestFullscreen({ navigationUI: 'hide' }); } catch (e) {}
+  try { await screen.orientation.lock('landscape'); } catch (e) {}
+  try { await navigator.wakeLock.request('screen'); } catch (e) {}
+  panel.classList.add('hidden');
+}
+document.getElementById('startBtn').onclick = goFullscreen;
+
+// ------------------------------------------------------------------ sources
+const vid = document.getElementById('vid'), img = document.getElementById('mjpeg');
+const testCanvas = document.createElement('canvas'); testCanvas.width = 1280; testCanvas.height = 720;
+const tctx = testCanvas.getContext('2d');
+let source = 'testfp', newFrame = true, srcW = 1280, srcH = 720;
+const srcSel = document.getElementById('srcSel');
+srcSel.onchange = () => {
+  const v = srcSel.value;
+  for (const [id, on] of [['urlBox', v === 'url'], ['camBox', v === 'camera'], ['fileBox', v === 'file']])
+    document.getElementById(id).style.display = on ? '' : 'none';
+  if (v === 'test' || v === 'testfp') source = v;
+  if (v === 'camera') listCams();
+  lsSet('psvr3d.src', v);
+};
+const savedUrl = lsGet('psvr3d.url'); if (savedUrl) document.getElementById('srcUrl').value = savedUrl;
+document.getElementById('urlGo').onclick = () => {
+  const u = document.getElementById('srcUrl').value.trim(); if (!u) return;
+  lsSet('psvr3d.url', u);
+  const viaProxy = location.port === '8765' && !u.startsWith(location.origin);
+  img.crossOrigin = viaProxy ? null : 'anonymous';
+  img.src = viaProxy ? '/proxy?u=' + encodeURIComponent(u) : u;
+  source = 'img'; st.src = 'connecting ' + u;
+};
+img.onerror = () => { st.src = 'stream error (check URL / ScreenStream running / same Wi-Fi)'; };
+async function listCams() {
+  const sel = document.getElementById('camSel'); sel.innerHTML = '';
+  try { const tmp = await navigator.mediaDevices.getUserMedia({ video: true }); tmp.getTracks().forEach(t => t.stop()); } catch (e) {}
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  devs.forEach((d, i) => { const o = document.createElement('option'); o.value = d.deviceId; o.textContent = d.label || ('camera ' + i); sel.appendChild(o); });
+  if (!devs.length) st.src = 'no video inputs visible to the browser';
+}
+document.getElementById('camGo').onclick = async () => {
+  const id = document.getElementById('camSel').value;
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ video: { deviceId: id ? { exact: id } : undefined, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 } }, audio: false });
+    vid.srcObject = s; await vid.play(); source = 'video';
+  } catch (e) { st.src = 'camera error: ' + e.message; }
+};
+document.getElementById('srcFile').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  vid.srcObject = null; vid.src = URL.createObjectURL(f); await vid.play().catch(() => {}); source = 'video';
+};
+if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+  const cb = () => { newFrame = true; vid.requestVideoFrameCallback(cb); }; vid.requestVideoFrameCallback(cb);
+}
+{ const sv = LOCAL ? lsGet('psvr3d.src') : null; if (sv && sv !== 'test' && sv !== 'testfp') { srcSel.value = sv; srcSel.onchange(); if (sv === 'url' && savedUrl) document.getElementById('urlGo').click(); } }
+
+// Procedural "driving" scene: gives the depth estimator the same cues a GTA frame has.
+function drawTest(t, fp) {
+  const W = 1280, H = 720, c = tctx, hz = 300;
+  const back = fp && Math.floor(t / 8) % 2 === 1;            // first-person: every 8 s, an R3-style look-back cut
+  const vx = 640 + Math.sin(t * 0.3) * (fp ? 260 : 40);      // first-person camera turns more
+  if (back) { c.save(); c.translate(W, 0); c.scale(-1, 1); c.filter = 'hue-rotate(160deg) brightness(0.6) contrast(1.4)'; }
+  let g = c.createLinearGradient(0, 0, 0, hz); g.addColorStop(0, '#3d7ad8'); g.addColorStop(1, '#bcd6f2');
+  c.fillStyle = g; c.fillRect(0, 0, W, hz);
+  c.fillStyle = '#e9b97a'; c.beginPath(); c.arc(980, 120, 34, 0, 7); c.fill();
+  c.fillStyle = '#5c6b4a'; c.fillRect(0, hz, W, H - hz);
+  c.fillStyle = '#3b3d42'; c.beginPath(); c.moveTo(vx - 8, hz); c.lineTo(vx + 8, hz); c.lineTo(W * 0.95, H); c.lineTo(W * 0.05, H); c.fill();
+  c.strokeStyle = '#f2e6a0'; c.lineWidth = 2;
+  for (let i = 0; i < 14; i++) { const z = ((i + (t * 2.2) % 1) / 14); const y0 = hz + (H - hz) * z * z, y1 = hz + (H - hz) * Math.min(1, (z + 0.03) ** 2);
+    const x0 = vx + (640 - vx) * z * z, x1 = vx + (640 - vx) * Math.min(1, (z + 0.03) ** 2); c.lineWidth = 1 + 8 * z * z; c.beginPath(); c.moveTo(x0, y0); c.lineTo(x1, y1); c.stroke(); }
+  for (let side = -1; side <= 1; side += 2) for (let i = 9; i >= 0; i--) {
+    const z = ((i + (t * 0.8) % 1) / 10), s = 0.08 + z * z * 1.6;
+    const bx = vx + side * (90 + 600 * z * z) - (side < 0 ? 200 * s : 0), bh = (180 + (i * 37) % 120) * s, by = hz - bh + 40 * z * z;
+    c.fillStyle = `hsl(${(i * 47) % 360},18%,${38 + (i * 13) % 25}%)`; c.fillRect(bx, by, 200 * s, bh + 60 * s);
+    c.fillStyle = 'rgba(255,240,200,.55)';
+    for (let wy = 0; wy < 6; wy++) for (let wx = 0; wx < 4; wx++) c.fillRect(bx + (12 + wx * 46) * s, by + (12 + wy * (bh / s) / 6.5) * s, 22 * s, 14 * s);
+  }
+  if (back) c.restore();
+  c.filter = 'none';
+  if (fp) { drawFpOverlay(t); return; }
+  const cx = 640 + Math.sin(t * 0.9) * 30, cy = 585;
+  c.fillStyle = 'rgba(0,0,0,.45)'; c.beginPath(); c.ellipse(cx, cy + 62, 150, 22, 0, 0, 7); c.fill();
+  c.fillStyle = '#b3172a'; c.fillRect(cx - 140, cy - 30, 280, 85); c.fillStyle = '#7d0f1d'; c.fillRect(cx - 100, cy - 75, 200, 50);
+  c.fillStyle = '#9cc3e6'; c.fillRect(cx - 88, cy - 68, 176, 36);
+  c.fillStyle = '#ff4646'; c.fillRect(cx - 132, cy - 10, 42, 16); c.fillRect(cx + 90, cy - 10, 42, 16);
+  c.fillStyle = '#111'; c.fillRect(cx - 130, cy + 50, 50, 22); c.fillRect(cx + 80, cy + 50, 50, 22);
+  c.fillStyle = 'rgba(10,10,10,.7)'; c.beginPath(); c.arc(110, 620, 80, 0, 7); c.fill();
+  c.strokeStyle = '#ddd'; c.lineWidth = 3; c.stroke(); c.fillStyle = '#4fd1ff'; c.beginPath(); c.moveTo(110, 600); c.lineTo(100, 630); c.lineTo(120, 630); c.fill();
+  c.fillStyle = '#7ef07e'; c.font = 'bold 34px system-ui'; c.textAlign = 'right'; c.fillText('$1,250,000', 1240, 60);
+}
+
+function drawFpOverlay(t) {
+  const c = tctx, bob = Math.sin(t * 6) * 4;
+  // camera-attached: a pistol held bottom-right (moves with walk bob, never with the world)
+  c.fillStyle = '#2a2a2e'; c.beginPath(); c.moveTo(900, 720); c.lineTo(960, 560 + bob); c.lineTo(1130, 520 + bob); c.lineTo(1150, 560 + bob);
+  c.lineTo(1040, 600 + bob); c.lineTo(1010, 720); c.fill();
+  c.fillStyle = '#c79a6b'; c.beginPath(); c.ellipse(985, 650 + bob, 70, 48, -0.5, 0, 7); c.fill();
+  // screen-locked HUD: minimap bottom-left, money top-right, crosshair centre - pixel-identical every frame
+  c.fillStyle = 'rgba(10,10,10,.85)'; c.beginPath(); c.arc(110, 620, 80, 0, 7); c.fill();
+  c.strokeStyle = '#ddd'; c.lineWidth = 3; c.stroke(); c.fillStyle = '#4fd1ff'; c.beginPath(); c.moveTo(110, 600); c.lineTo(100, 630); c.lineTo(120, 630); c.fill();
+  c.fillStyle = '#7ef07e'; c.font = 'bold 34px system-ui'; c.textAlign = 'right'; c.fillText('$1,250,000', 1240, 60);
+  c.fillStyle = '#fff'; c.fillRect(638, 350, 4, 20); c.fillRect(630, 358, 20, 4);
+}
+
+// ------------------------------------------------------------------ WebGL
+const gl = cvs.getContext('webgl2', { antialias: false, alpha: false, desynchronized: true, powerPreference: 'high-performance' });
+if (!gl) { document.body.innerHTML = '<p style="padding:20px">WebGL2 not available in this browser.</p>'; throw new Error('no webgl2'); }
+const VS = `#version 300 es
+void main(){ vec2 p = vec2((gl_VertexID<<1)&2, gl_VertexID&2); gl_Position = vec4(p*2.0-1.0,0.,1.); }`;
+
+// Depth synthesis by behaviour group, not per-pixel reconstruction (see docs/ARCHITECTURE.md):
+//   screen-locked (HUD)  -> found by temporal stability: still while its surroundings move -> screen plane, zero disparity
+//   ground plane         -> exact: flat ground under a pinhole camera has disparity linear in distance below the horizon
+//   sky / infinity       -> top, bright, smooth -> far
+//   camera-attached near -> first-person hands / gun / bonnet: capped pop-out so it never strains the eyes
+// Texture channels: R depth (1 near, 0 far)  G screen-locked confidence  B this frame's luma  A local motion energy
+const FS_DEPTH = `#version 300 es
+precision highp float;
+uniform sampler2D src, prev, mlTex; uniform vec2 size;
+uniform float smoothK, skyK, subjK, mlK, hasPrev, hasML, cut, horizon, nearcap, conv, hudAuto, profile, gmotion;
+out vec4 o;
+float luma(vec3 c){ return dot(c, vec3(.299,.587,.114)); }
+void main(){
+  vec2 uv = gl_FragCoord.xy / size;            // image coords, y down (row 0 = top)
+  vec3 c1 = textureLod(src, uv, 3.0).rgb;
+  vec3 c2 = textureLod(src, uv, 5.5).rgb;
+  float detail = length(c1 - c2);
+  vec4 P = texture(prev, uv);
+  // ---- ground plane: d = (y - horizon) / (1 - horizon), exact for flat ground (disparity ~ 1/Z ~ y - y_h)
+  float g = clamp((uv.y - horizon) / max(0.05, 1.0 - horizon), 0.0, 1.0);
+  float d = 0.10 + 0.80 * g;
+  // ---- sky / effectively infinite
+  float above = smoothstep(horizon + 0.02, horizon - 0.25, uv.y);
+  float sky = above * smoothstep(0.25, 0.65, luma(c1)) * (1.0 - smoothstep(0.02, 0.10, detail))
+            * (0.55 + 0.45 * smoothstep(-0.05, 0.10, c1.b - c1.r));
+  d = mix(d, 0.0, skyK * sky);
+  // ---- things standing up out of the ground (buildings, cars, people) sit a little in front of the ground behind them
+  d += 0.10 * smoothstep(0.03, 0.16, detail) * (1.0 - g);
+  // ---- third-person: the player / car lives low-centre
+  if (profile < 0.5) {
+    float subj = exp(-(pow(uv.x - 0.5, 2.0) / 0.018 + pow(uv.y - 0.66, 2.0) / 0.028));
+    d += subjK * 0.22 * subj * (0.4 + 0.6 * smoothstep(0.02, 0.12, detail));
+  }
+  // ---- aerial perspective: low-contrast bright areas read as distant
+  d -= 0.08 * smoothstep(0.55, 0.85, luma(c2)) * (1.0 - smoothstep(0.03, 0.12, detail)) * (1.0 - g);
+  if (hasML > 0.5) d = mix(d, texture(mlTex, uv).r, mlK);
+  // ---- camera-attached near field: cap how far anything can pop out in front of the screen plane
+  d = min(clamp(d, 0.0, 1.0), conv + nearcap * (1.0 - conv));
+  // ---- learn infrequently, reuse continuously: temporal blend unless the camera just cut
+  float keep = (hasPrev > 0.5 && cut < 0.5) ? smoothK : 0.0;
+  d = mix(d, P.r, keep);
+  // ---- screen-locked detection (persists across cuts: the HUD does not move when the camera does)
+  float lum = luma(textureLod(src, uv, 1.0).rgb);
+  float diff = hasPrev > 0.5 ? abs(lum - P.b) : 0.0;
+  float motion = hasPrev > 0.5 ? mix(P.a, diff, 0.25) : 0.0;
+  // an EDGE that stays still while the frame as a whole moves is screen-locked. Flat areas are ignored on purpose:
+  // shifting a textureless region for stereo is invisible, so misjudging one costs nothing.
+  float edge = length(textureLod(src, uv, 0.0).rgb - textureLod(src, uv, 2.0).rgb);
+  float hud = P.g;
+  if (hasPrev > 0.5 && cut < 0.5 && gmotion > 0.004) {
+    if (edge > 0.04 && motion < 0.25 * gmotion) hud = min(1.0, hud + 0.03);   // ~1 s of camera motion to become HUD
+    else if (motion > gmotion) hud = max(0.0, hud - 0.2);                     // stops being HUD quickly
+  }
+  d = mix(d, conv, hudAuto * smoothstep(0.5, 0.9, hud));
+  o = vec4(d, hud, lum, motion);
+}`;
+
+const FS_MAIN = `#version 300 es
+precision highp float;
+uniform sampler2D src, depthTex;
+uniform vec2 res; uniform mat3 headR, scrInv; uniform vec3 eyeL, eyeR, eyeC;
+uniform float flatTan, sbs, tanHalf, k1, k2, ca, lensX, lensY, fillX, fillY, lensOn, swapEyes;
+uniform vec3 calL, calR;   // per-eye x, y offset (lens units, y down) and scale, from the alignment app
+uniform float dist, cylR, arcHalf, scrH, imgAspect;
+uniform float depthK, conv, hud, ambient, floorK, grid, bright;
+out vec4 o;
+float taper(vec2 uv){
+  float e = min(min(uv.x, 1.0-uv.x), min(uv.y, 1.0-uv.y));
+  float t = smoothstep(0.0, 0.07, e);                      // no window violations at the frame edge
+  float bl = smoothstep(0.30, 0.22, uv.x) * smoothstep(0.66, 0.74, uv.y);   // minimap
+  float tr = smoothstep(0.66, 0.74, uv.x) * smoothstep(0.28, 0.20, uv.y);   // money / weapon
+  return t * (1.0 - hud * max(bl, tr));
+}
+float disp(vec2 uv){ return depthK * 0.018 * (texture(depthTex, uv).r - conv) * taper(uv); }
+vec2 dibr(vec2 uv, float sgn){                          // find source pixel that lands here
+  float x = uv.x;
+  for (int i = 0; i < 4; i++) x = uv.x - sgn * disp(vec2(x, uv.y));
+  return vec2(x, uv.y);
+}
+// ray -> curved screen (cylinder) uv; returns false if no hit
+bool screenUV(vec3 ro, vec3 rd, out vec2 suv){
+  ro = scrInv * ro; rd = scrInv * rd;
+  float cz = -dist + cylR;
+  vec2 oc = vec2(ro.x, ro.z - cz), d = rd.xz;
+  float a = dot(d, d); if (a < 1e-6) return false;
+  float b = dot(oc, d), c = dot(oc, oc) - cylR * cylR, disc = b*b - a*c;
+  if (disc < 0.0) return false;
+  float t = (-b + sqrt(disc)) / a; if (t <= 0.0) return false;
+  vec3 h = ro + t * rd;
+  float ang = atan(h.x, -(h.z - cz));
+  suv = vec2(ang / arcHalf * 0.5 + 0.5, 0.5 - h.y / scrH);
+  return true;
+}
+// shift: the stereo (DIBR) displacement. Computed once, on the green ray, and reused for red and blue:
+// the three rays differ by ~1% (chromatic correction) while the iterative depth lookup is the expensive part.
+vec3 sampleScreen(vec3 ro, vec3 rd, float sgn, bool first, inout float shift, out float hitMask){
+  vec2 suv; hitMask = 0.0;
+  if (!screenUV(ro, rd, suv)) return vec3(0);
+  vec2 uc = clamp(suv, 0.0, 1.0);
+  vec2 od = (suv - uc) * vec2(1.0, imgAspect);
+  float outD = length(od);
+  if (outD <= 0.0) {
+    hitMask = 1.0;
+    if (first) shift = dibr(suv, sgn).x - suv.x;
+    return textureLod(src, vec2(suv.x + shift, suv.y), 0.0).rgb;
+  }
+  // peripheral fill: blurred edge colours bleeding outward - peripheral vision is low-res, it only needs motion + light
+  return textureLod(src, uc, 6.5).rgb * ambient * 0.75 * exp(-outD * 4.0);
+}
+void main(){
+  vec2 fc = gl_FragCoord.xy / res;
+  float e = 0.0; vec2 euv = fc; vec3 eye = eyeC;
+  bool warp = sbs > 0.5 && sbs < 1.5, cross = sbs > 1.5;
+  if (sbs > 0.5) {
+    e = fc.x < 0.5 ? 0.0 : 1.0; if (cross) e = 1.0 - e;
+    if (warp && swapEyes > 0.5) e = 1.0 - e;               // left half of the panel shows the right eye's view
+    euv = vec2(fract(fc.x * 2.0), fc.y); eye = e < 0.5 ? eyeL : eyeR;
+  }
+  float eyeAspect = warp ? (960.0/1080.0) : (sbs > 0.5 ? res.x * 0.5 / res.y : res.x / res.y);
+  vec2 p = (euv - 0.5) * 2.0 * vec2(eyeAspect * fillX, fillY);
+  float sgn = e < 0.5 ? 1.0 : -1.0;
+  if (sbs < 0.5) { sgn = 0.0; }
+  if (warp) {
+    vec3 cal = e < 0.5 ? calL : calR;                     // same transform as the alignment app: move, then scale
+    p = (p - vec2(cal.x, -cal.y)) / cal.z;
+    p -= vec2(e < 0.5 ? lensX : -lensX, lensY);
+  }
+  float r2 = dot(p, p);
+  bool lens = warp && lensOn > 0.5;
+  float distort = lens ? (1.0 + k1 * r2 + k2 * r2 * r2) : 1.0;
+  float th = warp ? tanHalf : flatTan;
+  vec3 col = vec3(0); float hitG = 0.0; vec3 rdG = vec3(0, 0, -1);
+  float shift = 0.0;
+  for (int k = 0; k < 3; k++) {
+    int ch = k == 0 ? 1 : (k == 1 ? 0 : 2);                // green first: it computes the shared stereo shift
+    float s = distort * (lens ? (1.0 + ca * float(ch - 1)) : 1.0);
+    vec3 rd = headR * normalize(vec3(p * s * th, -1.0));
+    float hm; vec3 c = sampleScreen(eye, rd, sgn, k == 0, shift, hm);
+    col[ch] = c[ch];
+    if (ch == 1) { hitG = hm; rdG = rd; }
+  }
+  // floor: a stable "rest frame" under the screen calms the vestibular system; screen light spills onto it
+  float ft = (-1.15 - eye.y) / min(rdG.y, -1e-3);
+  vec3 fh = eye + ft * rdG;
+  vec2 ff = 0.5 - abs(fract(fh.xz) - 0.5); vec2 fw = fwidth(fh.xz) * 1.2 + 1e-4;
+  if (rdG.y < -0.01 && floorK > 0.0) {
+    float line = max(smoothstep(fw.x, 0.0, ff.x), smoothstep(fw.y, 0.0, ff.y));
+    vec3 hs = scrInv * fh;
+    float spill = exp(-length(hs.xz - vec2(0.0, -dist)) * 0.55);
+    vec3 avg = textureLod(src, vec2(0.5), 12.0).rgb;
+    vec3 fl = (vec3(0.30, 0.36, 0.45) * line * 0.22 + avg * spill * 0.35) * floorK * exp(-ft * 0.12);
+    col += (1.0 - hitG) * fl;
+  }
+  if (grid > 0.5 && warp) {
+    vec2 tp = p * distort * tanHalf * 5.0;
+    vec2 f = abs(fract(tp + 0.5) - 0.5); vec2 w = fwidth(tp) * 1.2;
+    float l = max(smoothstep(w.x, 0.0, f.x), smoothstep(w.y, 0.0, f.y));
+    float cross = (abs(p.x) < 0.004 || abs(p.y) < 0.004) ? 1.0 : 0.0;
+    col = mix(col, vec3(0.2, 1.0, 0.4), max(l * 0.8, cross));
+  }
+  float vig = lens ? smoothstep(1.55, 1.25, sqrt(r2)) : 1.0;
+  o = vec4(col * bright * vig, 1.0);
+}`;
+
+function compile(type, srcTxt) {
+  const s = gl.createShader(type); gl.shaderSource(s, srcTxt); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+function program(fs) {
+  const p = gl.createProgram(); gl.attachShader(p, compile(gl.VERTEX_SHADER, VS)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const info = gl.getActiveUniform(p, i); u[info.name] = gl.getUniformLocation(p, info.name); }
+  return { p, u };
+}
+let P_DEPTH, P_MAIN;
+try { P_DEPTH = program(FS_DEPTH); P_MAIN = program(FS_MAIN); }
+catch (e) { statusEl.textContent = 'Shader error: ' + e.message; console.error(e); throw e; }
+gl.bindVertexArray(gl.createVertexArray());
+
+function tex(w, h, filter, mip) {
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mip ? gl.LINEAR_MIPMAP_LINEAR : filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  if (w) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  return t;
+}
+const srcTex = tex(0, 0, gl.LINEAR, true);
+const DW = 256, DH = 144;
+// half-float depth/state: the screen-locked detector integrates tiny per-frame changes that 8-bit would round away
+const F16 = !!gl.getExtension('EXT_color_buffer_float') || !!gl.getExtension('EXT_color_buffer_half_float');
+function stateTex() { const t = tex(0, 0, gl.LINEAR, false);
+  if (F16) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, DW, DH, 0, gl.RGBA, gl.HALF_FLOAT, null);
+  else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, DW, DH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  return t; }
+const depthTex = [stateTex(), stateTex()];
+const fbos = depthTex.map(t => { const f = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0); return f; });
+gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+const mlTex = tex(0, 0, gl.LINEAR, false);
+let dIdx = 0, hasPrev = 0, hasML = 0, haveSrc = false;
+
+const cutCanvas = document.createElement('canvas'); cutCanvas.width = 32; cutCanvas.height = 18;
+const cutCtx = cutCanvas.getContext('2d', { willReadFrequently: true }); let cutPrev = null, cutCool = 0, gMotion = 0, gBase = 0.01;
+function detectCut(el) {
+  try { cutCtx.drawImage(el, 0, 0, 32, 18); } catch (e) { return false; }
+  const d = cutCtx.getImageData(0, 0, 32, 18).data, cur = new Float32Array(32 * 18);
+  for (let i = 0; i < cur.length; i++) cur[i] = (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) / 255;
+  let diff = 0; if (cutPrev) for (let i = 0; i < cur.length; i++) diff += Math.abs(cur[i] - cutPrev[i]);
+  diff /= cur.length; cutPrev = cur; gMotion = diff;
+  // adaptive: a cut is a frame change several times larger than the recent normal frame-to-frame motion
+  const ratio = 9 - 6 * S.cut, isCut = S.cut > 0 && cutCool === 0 && diff > 0.05 && diff > ratio * gBase;
+  if (!isCut) gBase += (Math.max(diff, 0.002) - gBase) * 0.05;
+  if (cutCool > 0) cutCool--;
+  if (isCut) { cutCool = 10; st.cuts++; hasML = 0; return true; }
+  return false;
+}
+function uploadSource(el) {
+  gl.bindTexture(gl.TEXTURE_2D, srcTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, el); }
+  catch (e) { st.src = 'cannot read frames (cross-origin?) - open this page through psvrd'; return false; }
+  gl.generateMipmap(gl.TEXTURE_2D);
+  return true;
+}
+function depthPass(cut) {
+  const g = gl, u = P_DEPTH.u, out = 1 - dIdx;
+  g.bindFramebuffer(g.FRAMEBUFFER, fbos[out]); g.viewport(0, 0, DW, DH); g.useProgram(P_DEPTH.p);
+  g.activeTexture(g.TEXTURE0); g.bindTexture(g.TEXTURE_2D, srcTex); g.uniform1i(u.src, 0);
+  g.activeTexture(g.TEXTURE1); g.bindTexture(g.TEXTURE_2D, depthTex[dIdx]); g.uniform1i(u.prev, 1);
+  g.activeTexture(g.TEXTURE2); g.bindTexture(g.TEXTURE_2D, mlTex); g.uniform1i(u.mlTex, 2);
+  g.uniform2f(u.size, DW, DH); g.uniform1f(u.smoothK, S.smooth); g.uniform1f(u.skyK, S.sky); g.uniform1f(u.subjK, S.subject);
+  g.uniform1f(u.mlK, S.ml); g.uniform1f(u.hasPrev, hasPrev); g.uniform1f(u.hasML, hasML && S.ml > 0 ? 1 : 0);
+  g.uniform1f(u.cut, cut ? 1 : 0); g.uniform1f(u.horizon, S.horizon); g.uniform1f(u.nearcap, S.nearcap);
+  g.uniform1f(u.conv, S.conv); g.uniform1f(u.hudAuto, S.hudauto); g.uniform1f(u.profile, S.profile); g.uniform1f(u.gmotion, cut ? 0 : gMotion);
+  g.drawArrays(g.TRIANGLES, 0, 3);
+  g.bindFramebuffer(g.FRAMEBUFFER, null);
+  dIdx = out; hasPrev = 1;
+}
+
+// ------------------------------------------------------------------ optional AI depth (Depth Anything V2 Small, served by psvrd)
+// "Learn infrequently": a few inferences per second feed the slow depth texture; every displayed frame reuses it.
+const ORT_VER = '1.20.1', ML_W = 364, ML_H = 196;           // model input must be a multiple of 14
+let mlSess = null, mlLoading = false, mlBusy = false, mlLast = 0, mlLo = 0, mlHi = 1, ortMod = null;
+const mlCanvas = document.createElement('canvas'); mlCanvas.width = ML_W; mlCanvas.height = ML_H;
+const mlCtx = mlCanvas.getContext('2d', { willReadFrequently: true });
+async function mlTick(srcEl) {
+  if (S.ml <= 0 || mlBusy || !haveSrc || !LOCAL) return;
+  const now = performance.now(); if (now - mlLast < 150) return;
+  if (!mlSess) {
+    if (mlLoading) return; mlLoading = true; st.ml = 'loading model...';
+    try {
+      ortMod = await import(`https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VER}/dist/ort.webgpu.min.mjs`);
+      ortMod.env.wasm.wasmPaths = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VER}/dist/`;
+      const eps = navigator.gpu ? ['webgpu', 'wasm'] : ['wasm'];
+      mlSess = await ortMod.InferenceSession.create('/models/depth.onnx', { executionProviders: eps, graphOptimizationLevel: 'all' });
+      st.ml = 'ready (' + eps[0] + ')';
+    } catch (e) { st.ml = 'unavailable: ' + (e.message || e); setKey('ml', 0); mlLoading = false; return; }
+  }
+  mlBusy = true; mlLast = now;
+  try {
+    mlCtx.drawImage(srcEl, 0, 0, ML_W, ML_H);
+    const px = mlCtx.getImageData(0, 0, ML_W, ML_H).data, n = ML_W * ML_H, x = new Float32Array(3 * n);
+    const mean = [0.485, 0.456, 0.406], std = [0.229, 0.224, 0.225];
+    for (let i = 0; i < n; i++) for (let c = 0; c < 3; c++) x[c * n + i] = (px[i * 4 + c] / 255 - mean[c]) / std[c];
+    const feeds = {}; feeds[mlSess.inputNames[0]] = new ortMod.Tensor('float32', x, [1, 3, ML_H, ML_W]);
+    const out = (await mlSess.run(feeds))[mlSess.outputNames[0]];
+    const dims = out.dims, h = dims[dims.length - 2], w = dims[dims.length - 1], d = out.data;
+    // robust, temporally smoothed normalisation (2nd/98th percentile) so the depth scale doesn't pump frame to frame
+    const sample = []; for (let i = 0; i < d.length; i += 37) sample.push(d[i]); sample.sort((p, q) => p - q);
+    const lo = sample[Math.floor(sample.length * 0.02)], hi = sample[Math.floor(sample.length * 0.98)];
+    mlLo += (lo - mlLo) * 0.2; mlHi += (hi - mlHi) * 0.2;
+    const u8 = new Uint8Array(w * h), k = 255 / ((mlHi - mlLo) || 1);
+    for (let i = 0; i < u8.length; i++) u8[i] = Math.max(0, Math.min(255, (d[i] - mlLo) * k));   // larger = nearer
+    gl.bindTexture(gl.TEXTURE_2D, mlTex); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, w, h, 0, gl.RED, gl.UNSIGNED_BYTE, u8);
+    hasML = 1; st.ml = `on (${Math.round(1000 / Math.max(1, performance.now() - now))} Hz)`;
+  } catch (e) { st.ml = 'error: ' + e.message; }
+  mlBusy = false;
+}
+
+// ------------------------------------------------------------------ screen geometry
+function screenGeom() {
+  const dist = S.dist, R = dist / Math.max(0.02, S.curve), halfW = S.width * Math.PI / 360, cz = -dist + R;
+  // find arc half-angle a so that the screen edge subtends halfW from the viewer
+  let lo = 0, hi = Math.PI * 0.98;
+  for (let i = 0; i < 40; i++) { const a = (lo + hi) / 2; const x = R * Math.sin(a), z = cz - R * Math.cos(a);
+    if (Math.atan2(x, -z) < halfW) lo = a; else hi = a; }
+  const arcHalf = (lo + hi) / 2;
+  const arcLen = 2 * R * arcHalf;
+  return { R, arcHalf, scrH: arcLen * srcH / srcW };
+}
+
+// ------------------------------------------------------------------ frame loop
+let screenYaw = 0, lastT = performance.now(), frames = 0, fpsT = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
+  // source
+  let el = null;
+  if (source === 'test' || source === 'testfp') { drawTest(now / 1000, source === 'testfp'); el = testCanvas; newFrame = true; }
+  else if (source === 'video' && vid.readyState >= 2) { el = vid; if (!('requestVideoFrameCallback' in vid)) newFrame = true; }
+  else if (source === 'img' && img.complete && img.naturalWidth) { el = img; newFrame = true; }
+  if (el && newFrame) {
+    const w = el.videoWidth || el.naturalWidth || el.width, h = el.videoHeight || el.naturalHeight || el.height;
+    if (w && h) { srcW = w; srcH = h; if (uploadSource(el)) { haveSrc = true; depthPass(detectCut(el)); st.src = `${source} ${w}x${h}`; } }
+    newFrame = false;
+  }
+  if (el) mlTick(el);
+  // canvas size
+  const dpr = Math.min(devicePixelRatio || 1, 2560 / Math.max(1, innerWidth));
+  const W = Math.round(innerWidth * dpr), H = Math.round(innerHeight * dpr);
+  if (cvs.width !== W || cvs.height !== H) { cvs.width = W; cvs.height = H; }
+  // head pose
+  let q;
+  if (pose) {
+    const age = (now - poseT) / 1000 + S.predict / 1000, w = pose.w;
+    q = qn(qmul(pose.q, [1, w[0] * age / 2, w[1] * age / 2, w[2] * age / 2]));
+  } else q = qmul(qaxis(0, 1, 0, -dragYaw), qaxis(1, 0, 0, -dragPitch));
+  if (S.invyaw) q[2] = -q[2]; if (S.invpitch) q[1] = -q[1]; if (S.invroll) q[3] = -q[3];
+  lastRawQ = q;
+  q = qn(qmul(recenterQ, q));
+  const Rm = qmat(q);
+  // lazy-follow screen
+  if (S.follow > 0) {
+    let diff = yawOf(q) - screenYaw; diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+    const dead = 0.35;
+    if (Math.abs(diff) > dead) screenYaw += (diff - Math.sign(diff) * dead) * Math.min(1, S.follow * dt * 3);
+  }
+  const cs = Math.cos(-screenYaw), sn = Math.sin(-screenYaw);
+  const scrInv = [cs, 0, -sn, 0, 1, 0, sn, 0, cs]; // column-major RotY(-screenYaw)
+  // eyes with neck pivot (rotating the head also translates the eyes -> real parallax on the virtual room)
+  const ny = S.neck ? 0.10 : 0, nz = S.neck ? -0.08 : 0, half = S.ipd / 2000;
+  const eyeW = off => { const v = mulMV(Rm, [off, ny, nz]); return [v[0], v[1] - ny, v[2] - nz]; };
+  const eL = eyeW(-half), eR = eyeW(half), eC = eyeW(0);
+  // output fill: when Android mirrors a wide phone onto a 16:9 HDMI signal it letterboxes
+  let fillX = 1, fillY = 1;
+  if (S.fill16 && S.sbs === 1) { const a = W / H, t = 16 / 9; if (a > t) fillY = t / a; else fillX = a / t; }
+  const gm = screenGeom();
+  // draw
+  gl.viewport(0, 0, W, H); gl.useProgram(P_MAIN.p);
+  const u = P_MAIN.u;
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, srcTex); gl.uniform1i(u.src, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, depthTex[dIdx]); gl.uniform1i(u.depthTex, 1);
+  gl.uniform2f(u.res, W, H);
+  gl.uniformMatrix3fv(u.headR, false, Rm); gl.uniformMatrix3fv(u.scrInv, false, scrInv);
+  gl.uniform3fv(u.eyeL, eL); gl.uniform3fv(u.eyeR, eR); gl.uniform3fv(u.eyeC, eC);
+  { const ea = S.sbs === 2 ? (W / 2) / H : W / H; const hx = Math.min(1.35, S.width * Math.PI / 360 * 1.08 + 0.05);
+    gl.uniform1f(u.flatTan, Math.max(0.55, Math.tan(hx) / ea)); }
+  gl.uniform1f(u.sbs, S.sbs); gl.uniform1f(u.tanHalf, S.fov); gl.uniform1f(u.k1, S.k1); gl.uniform1f(u.k2, S.k2);
+  gl.uniform1f(u.ca, S.ca); gl.uniform1f(u.lensX, S.lensx); gl.uniform1f(u.lensY, S.lensy);
+  gl.uniform1f(u.fillX, fillX); gl.uniform1f(u.fillY, fillY);
+  gl.uniform1f(u.lensOn, S.warp); gl.uniform1f(u.swapEyes, S.swap);
+  gl.uniform3f(u.calL, S.lxo / 540, S.lyo / 540, S.lsc); gl.uniform3f(u.calR, S.rxo / 540, S.ryo / 540, S.rsc);
+  gl.uniform1f(u.dist, S.dist); gl.uniform1f(u.cylR, gm.R); gl.uniform1f(u.arcHalf, gm.arcHalf); gl.uniform1f(u.scrH, gm.scrH);
+  gl.uniform1f(u.imgAspect, srcH / srcW);
+  gl.uniform1f(u.depthK, haveSrc ? S.depth : 0); gl.uniform1f(u.conv, S.conv); gl.uniform1f(u.hud, S.hud);
+  gl.uniform1f(u.ambient, S.ambient); gl.uniform1f(u.floorK, S.floor); gl.uniform1f(u.grid, S.grid); gl.uniform1f(u.bright, S.bright);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  frames++; if (now - fpsT > 1000) { st.fps = frames; frames = 0; fpsT = now; }
+}
+requestAnimationFrame(frame);
+if (!LOCAL) {
+  for (const v of ['url', 'camera']) srcSel.querySelector(`option[value="${v}"]`).remove();
+  document.querySelectorAll('[data-usb], #recalBtn').forEach(b => b.hidden = true);
+  document.getElementById('hdHead').hidden = true;
+  sliderEls.ml[0].closest('.row').hidden = true;
+  document.querySelector('.hint').textContent = 'Standalone test. Drag to look around, double-tap or press H to show/hide this panel. Output mode 2 is cross-eye 3D: cross your eyes until the two pictures merge into a third in the middle. Mode 1 is what the headset gets.';
+}
+window.__psvr = { S, setKey, recenter, st, get pose() { return pose; },
+  readState() { gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[dIdx]); const typ = F16 ? gl.FLOAT : gl.UNSIGNED_BYTE;
+    const b = F16 ? new Float32Array(DW * DH * 4) : new Uint8Array(DW * DH * 4);
+    gl.readPixels(0, 0, DW, DH, gl.RGBA, typ, b); gl.bindFramebuffer(gl.FRAMEBUFFER, null); return { w: DW, h: DH, f16: F16, data: Array.from(b) }; } };
+</script>
+</body></html>
