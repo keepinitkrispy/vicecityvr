@@ -1,5 +1,5 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# Builds calibrate.apk on the phone in Termux (javac, d8, aapt2, zipalign, apksigner from Termux packages).
+# Builds calibrate.apk on the phone in Termux (javac, d8, aapt2, zipalign, apksigner, python3; no zip needed).
 set -euo pipefail
 cd "$(dirname "$0")"
 SDK="${ANDROID_SDK:-$HOME/android-sdk}"
@@ -15,7 +15,7 @@ rm -rf build && mkdir -p build/classes build/dex
 javac --release 11 -nowarn -cp "$JAR" -d build/classes $(find src -name '*.java')
 d8 --release --min-api 26 --lib "$JAR" --output build/dex $(find build/classes -name '*.class')
 aapt2 link -I "$JAR" --manifest AndroidManifest.xml -o build/unsigned.apk
-(cd build/dex && zip -q -j ../unsigned.apk classes.dex)
+python3 -c "import zipfile,sys; z=zipfile.ZipFile(sys.argv[1],'a'); z.write(sys.argv[2],'classes.dex'); z.close()" build/unsigned.apk build/dex/classes.dex
 zipalign -f -p 4 build/unsigned.apk build/aligned.apk
 apksigner sign --ks "$KS" --ks-pass pass:android --key-pass pass:android --out calibrate.apk build/aligned.apk
 apksigner verify calibrate.apk
