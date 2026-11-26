@@ -11,6 +11,8 @@ import android.net.Uri
 import android.opengl.GLSurfaceView
 import android.view.Display
 import android.view.Gravity
+import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
@@ -76,6 +78,10 @@ class PsvrOutput(private val activity: Activity, display: Display, width: Int, h
         glView.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
         setContentView(glView)
     }
+    // DualSense / gamepad input that lands on the headset display goes to the stream, like Momiji's own second screen.
+    // (With per-display focus, e.g. Pixel desktop mode, the headset window can hold focus and would otherwise eat it.)
+    override fun dispatchKeyEvent(event: KeyEvent) = activity.dispatchKeyEvent(event)
+    override fun dispatchGenericMotionEvent(event: MotionEvent) = activity.dispatchGenericMotionEvent(event)
     fun resumeOutput() { if (!released) glView.onResume() }
     fun releaseOutput() {
         if (released) return
