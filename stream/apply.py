@@ -83,4 +83,31 @@ edit("android/app/src/main/java/com/metallic/chiaki/stream/VideoRenderer.kt", " 
 edit("android/app/src/main/java/com/metallic/chiaki/stream/VideoRenderer.kt", "    private var blitProgram: Program? = null", "    private var blitProgram: Program? = null\n    @Volatile var psvrCalibration: PsvrCalibration? = null\n    private var psvrProgram: Program? = null")
 edit("android/app/src/main/java/com/metallic/chiaki/stream/VideoRenderer.kt", "        debandProgram = if (deband) {", "        psvrProgram = if (psvrCalibration != null) Program(createProgram(EFFECT_VERTEX_SHADER, PSVR_FRAGMENT_SHADER)).also {\n            GLES30.glUseProgram(it.id)\n            GLES30.glUniform1i(it.uniformLoc(\"u_Texture\"), 0)\n        } else null\n        debandProgram = if (deband) {")
 edit("android/app/src/main/java/com/metallic/chiaki/stream/VideoRenderer.kt", "        var frame = videoTarget.textureId\n", "        var frame = videoTarget.textureId\n        val cal = psvrCalibration\n        val stereo = psvrProgram\n        if (cal != null && stereo != null) {\n            val l = cal.eye(if (cal.swap) 1 else 0)\n            val r = cal.eye(if (cal.swap) 0 else 1)\n            val fit = minOf(960f/videoWidth,1080f/videoHeight)\n            drawPass(stereo,0,surfaceWidth,surfaceHeight,GLES30.GL_TEXTURE_2D,frame) {\n                GLES30.glUniform3f(stereo.uniformLoc(\"u_Left\"),l.x,l.y,l.scale)\n                GLES30.glUniform3f(stereo.uniformLoc(\"u_Right\"),r.x,r.y,r.scale)\n                GLES30.glUniform2f(stereo.uniformLoc(\"u_Lens\"),if(cal.warp)cal.k1 else 0f,if(cal.warp)cal.k2 else 0f)\n                GLES30.glUniform2f(stereo.uniformLoc(\"u_Picture\"),videoWidth*fit,videoHeight*fit)\n            }\n            return\n        }\n")
+# --- stable mono cinematic output: use the existing SGSR pipeline, never the stereo pass.
+edit(KT + 'stream/PsvrOutput.kt',
+     '    val renderer = VideoRenderer(width,height,false,0f,null,{ glView.requestRender() },onSurface)',
+     '''    private val monoShader = activity.assets.open(VideoRenderer.UPSCALE_SHADER_ASSET).bufferedReader().use { it.readText() }
+    val renderer = VideoRenderer(width,height,false,0f,monoShader,{ glView.requestRender() },onSurface)''')
+edit(KT + 'stream/PsvrOutput.kt', '        renderer.psvrCalibration = calibration', '        renderer.psvrCalibration = null')
+edit(KT + 'stream/PsvrOutput.kt', '        calibration=c; renderer.psvrCalibration=c; glView.requestRender()', '        calibration=c; glView.requestRender()')
+# Keep the session output attached across ordinary activity stop/start; release only on destruction.
+edit(KT + 'stream/StreamActivity.kt',
+     '\t\tif (psvrOutput != null) { viewModel.session.detachSurface(); psvrOutput?.releaseOutput(); psvrOutput = null }',
+     '\t\tpsvrOutput?.pauseOutput()')
+edit(KT + 'stream/PsvrOutput.kt', '    fun resumeOutput() { if (!released) glView.onResume() }',
+     '    fun resumeOutput() { if (!released) glView.onResume() }\n    fun pauseOutput() { if (!released) glView.onPause() }')
+edit(KT + 'stream/StreamActivity.kt', '\t\tpsvrOutput?.releaseOutput()\n\t\tcontrolsDisposable.dispose()',
+     '\t\tif (psvrOutput != null) { viewModel.session.detachSurface(); psvrOutput?.releaseOutput(); psvrOutput = null }\n\t\tcontrolsDisposable.dispose()')
+# No software H.264 decode or unbounded frame-latching loop in the non-stereo mode.
+edit(CPP + 'video-decoder.c', 'decoder->mv = chiaki_codec_is_h265(codec) ? NULL : mv_extractor_new();',
+     'decoder->mv = NULL;')
+edit(KT + 'stream/VideoRenderer.kt', 'repeat(pending) { _ -> it.updateTexImage() }', 'it.updateTexImage()')
+edit(KT + 'stream/VideoRenderer.kt', 'pendingFrames.incrementAndGet()', 'pendingFrames.set(1)')
+# The phone remains the controller; remove the obsolete alignment UI from the mono build.
+edit(KT + 'stream/StreamActivity.kt', '''\t\t\t\tval align = android.widget.Button(this).apply {
+\t\t\t\t\ttext = "Align / Save"
+\t\t\t\t\tsetOnClickListener { output.showAlignment() }
+\t\t\t\t}
+\t\t\t\tbinding.root.addView(align, android.widget.FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
+''', '')
 print('apply.py: all edits applied')
