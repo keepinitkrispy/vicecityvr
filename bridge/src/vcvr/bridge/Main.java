@@ -23,10 +23,14 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
+import java.io.InputStream;
 import java.util.Locale;
+import rikka.shizuku.Shizuku;
 
 // Phone screen: one button to start, live sliders for the 3D and per-eye fit.
-// Flow: Start -> headset to VR mode over USB -> Android asks what to share -> pick "A single app" -> Momiji.
+// One tap: opening the app (or plugging in the headset) does everything:
+// Shizuku pre-approves screen sharing + drawing on the headset (once) -> headset to VR mode -> capture -> opens Momiji.
+// Without Shizuku it still works, Android just asks to share each time.
 public class Main extends Activity {
     static final String ACTION_USB = "vcvr.bridge.USB";
     static final int REQ_CAPTURE = 7;
@@ -45,8 +49,8 @@ public class Main extends Activity {
         status = text("", 14); col.addView(status);
         usb = text("", 14); col.addView(usb);
 
-        Button start = new Button(this); start.setText("Start: pick Momiji when asked");
-        start.setOnClickListener(v -> begin()); col.addView(start);
+        Button start = new Button(this); start.setText("Start again");
+        start.setOnClickListener(v -> go()); col.addView(start);
         Button stop = new Button(this); stop.setText("Stop");
         stop.setOnClickListener(v -> startService(new Intent(this, Bridge.class).setAction("stop"))); col.addView(stop);
         Button vr = new Button(this); vr.setText("Headset: VR mode again");
@@ -61,16 +65,21 @@ public class Main extends Activity {
         Button reset = new Button(this); reset.setText("Reset all to defaults");
         reset.setOnClickListener(v -> { System.arraycopy(S.DEF, 0, S.v, 0, S.DEF.length); S.save(prefs); recreate(); });
         col.addView(reset);
-        col.addView(text("\nHow to use:\n1. Close XR Screen Utility (it draws to the same headset display).\n" +
-            "2. Tap Start. Allow \"Display over other apps\" the first time, then allow USB access.\n" +
-            "3. When Android asks what to share, choose \"A single app\" and pick Momiji.\n" +
-            "4. Open Momiji, rotate to landscape, start the stream. The controller stays with Momiji.\n" +
-            "5. Come back here any time to adjust; changes show in the headset immediately.", 14));
-
+        col.addView(text("\nOpening this app starts everything: headset VR mode, capture, then Momiji.\n" +
+            "First time only: allow Shizuku, and tick \"always\" if Android asks about the headset USB.\n" +
+            "Come back here any time to adjust; changes show in the headset immediately.", 14));
         ScrollView sc = new ScrollView(this); sc.addView(col); setContentView(sc);
         IntentFilter f = new IntentFilter(ACTION_USB);
         registerReceiver(usbReceiver, f, Context.RECEIVER_NOT_EXPORTED);
         tick();
+        if (!Bridge.running) ui.postDelayed(this::go, 300);
+    }
+
+    @Override protected void onNewIntent(Intent i) { super.onNewIntent(i); if (!Bridge.running) go(); }
+
+    @Override protected void onResume() {
+        super.onResume();
+        if (waitingOverlay && Settings.canDrawOverlays(this)) { waitingOverlay = false; begin(); }
     }
 
     @Override protected void onDestroy() { super.onDestroy(); try { unregisterReceiver(usbReceiver); } catch (Exception ignored) {} ui.removeCallbacksAndMessages(null); }
@@ -81,10 +90,67 @@ public class Main extends Activity {
         ui.postDelayed(this::tick, 500);
     }
 
+    // ------------------------------------------------------------------ one-tap start
+    static final String[] GAME_APPS = {"io.github.yazanj082.momiji", "com.metallic.chiaki", "com.playstation.remoteplay"};
+    boolean askedShizuku = false, waitingOverlay = false, going = false;
+
+    void go() {
+        if (Bridge.running) { launchGame(); return; }
+        if (going) return;
+        going = true;
+        if (Settings.canDrawOverlays(this) && prefs.getBoolean("projAllowed", false)) { begin(); return; }
+        Bridge.status = "setting up (first run)";
+        waitShizuku(0);
+    }
+
+    void waitShizuku(int tries) {
+        boolean up = false;
+        try { up = Shizuku.pingBinder(); } catch (Throwable ignored) {}
+        if (!up) {
+            if (tries < 12) { ui.postDelayed(() -> waitShizuku(tries + 1), 150); return; }
+            usbState = "Shizuku isn't running, so Android will ask to share each time"; begin(); return;
+        }
+        if (Shizuku.checkSelfPermission() != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            if (askedShizuku) { usbState = "Shizuku not allowed, so Android will ask to share each time"; begin(); return; }
+            askedShizuku = true;
+            Shizuku.addRequestPermissionResultListener(new Shizuku.OnRequestPermissionResultListener() {
+                @Override public void onRequestPermissionResult(int code, int result) {
+                    Shizuku.removeRequestPermissionResultListener(this);
+                    ui.post(() -> waitShizuku(0));
+                }
+            });
+            Shizuku.requestPermission(1);
+            return;
+        }
+        new Thread(() -> {
+            String pkg = getPackageName();
+            String out = shell("appops set " + pkg + " SYSTEM_ALERT_WINDOW allow; appops set " + pkg + " PROJECT_MEDIA allow; appops get " + pkg + " PROJECT_MEDIA");
+            boolean ok = out.contains("allow");
+            prefs.edit().putBoolean("projAllowed", ok).apply();
+            usbState = ok ? "screen sharing pre-approved through Shizuku" : "Shizuku approval failed: " + out.trim();
+            ui.post(this::begin);
+        }, "shizuku-grant").start();
+    }
+
+    // Shizuku runs this as the shell user (same as adb shell). newProcess is private in API 13, hence reflection.
+    static String shell(String cmd) {
+        try {
+            java.lang.reflect.Method m = Shizuku.class.getDeclaredMethod("newProcess", String[].class, String[].class, String.class);
+            m.setAccessible(true);
+            Process p = (Process) m.invoke(null, new String[]{"sh", "-c", cmd + " 2>&1"}, null, null);
+            StringBuilder sb = new StringBuilder(); byte[] b = new byte[4096]; int n;
+            try (InputStream in = p.getInputStream()) { while ((n = in.read(b)) > 0) sb.append(new String(b, 0, n)); }
+            p.waitFor();
+            return sb.toString();
+        } catch (Throwable e) { return "error: " + e; }
+    }
+
     void begin() {
+        going = false;
         if (!Settings.canDrawOverlays(this)) {
+            waitingOverlay = true;
             startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName())));
-            usbState = "allow \"Display over other apps\", come back, tap Start again"; return;
+            usbState = "turn on \"Display over other apps\" for Vice City VR, then press Back"; return;
         }
         if (Bridge.findHeadset(this) == null) { Bridge.status = "headset display not found (is the HDMI connected?)"; return; }
         headset(true);
@@ -92,10 +158,19 @@ public class Main extends Activity {
         startActivityForResult(mpm.createScreenCaptureIntent(), REQ_CAPTURE);
     }
 
+    void launchGame() {
+        for (String p : GAME_APPS) {
+            Intent li = getPackageManager().getLaunchIntentForPackage(p);
+            if (li != null) { startActivity(li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); return; }
+        }
+        usbState = "no Remote Play app found to open";
+    }
+
     @Override protected void onActivityResult(int req, int res, Intent data) {
         if (req != REQ_CAPTURE) return;
         if (res != RESULT_OK || data == null) { Bridge.status = "screen capture was not allowed"; return; }
         startForegroundService(new Intent(this, Bridge.class).putExtra("code", res).putExtra("data", data));
+        ui.postDelayed(this::launchGame, 800);
     }
 
     // ------------------------------------------------------------------ USB headset mode

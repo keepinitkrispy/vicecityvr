@@ -9,12 +9,21 @@ BT="$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)"
 D8="${D8:-$BT/d8}"; AAPT2="${AAPT2:-$BT/aapt2}"; ZIPALIGN="${ZIPALIGN:-$BT/zipalign}"; APKSIGNER="${APKSIGNER:-$BT/apksigner}"
 mkdir -p deps assets
 [ -f deps/ort.aar ] || curl -sSL -o deps/ort.aar https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/1.20.0/onnxruntime-android-1.20.0.aar
+for a in api provider shared aidl; do
+  [ -f deps/shizuku-$a.aar ] || curl -sSL -o deps/shizuku-$a.aar https://repo1.maven.org/maven2/dev/rikka/shizuku/$a/13.1.5/$a-13.1.5.aar
+done
 [ -f assets/depth.onnx ] || curl -sSL -o assets/depth.onnx https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model_quantized.onnx
 rm -rf build && mkdir -p build/classes build/dex build/ort build/apk/lib/arm64-v8a
 (cd build/ort && python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall('.')" ../../deps/ort.aar)
-javac --release 11 -nowarn -cp "$JAR:build/ort/classes.jar" -d build/classes $(find src -name '*.java')
-"$D8" --release --min-api 30 --lib "$JAR" --output build/dex $(find build/classes -name '*.class') build/ort/classes.jar
-"$AAPT2" link -I "$JAR" --manifest AndroidManifest.xml -A assets -0 onnx -o build/unsigned.apk
+LIBS=build/ort/classes.jar
+for a in api provider shared aidl; do
+  mkdir -p build/shz-$a && (cd build/shz-$a && python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall('.')" ../../deps/shizuku-$a.aar)
+  LIBS="$LIBS:build/shz-$a/classes.jar"
+done
+javac --release 11 -nowarn -cp "$JAR:$LIBS" -d build/classes $(find src -name '*.java')
+"$D8" --release --min-api 30 --lib "$JAR" --output build/dex $(find build/classes -name '*.class') ${LIBS//:/ }
+"$AAPT2" compile --dir res -o build/res.zip
+"$AAPT2" link -I "$JAR" --manifest AndroidManifest.xml build/res.zip -A assets -0 onnx -o build/unsigned.apk
 cp build/ort/jni/arm64-v8a/*.so build/apk/lib/arm64-v8a/
 cp build/dex/classes.dex build/apk/
 python3 - <<'PY'
