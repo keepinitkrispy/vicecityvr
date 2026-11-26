@@ -248,15 +248,26 @@ public class Bridge extends Service {
                 st.setOnFrameAvailableListener(t -> frameAvail = true, main);
                 cap = new Surface(st);
                 attachCapture(cap, capW, capH);
-                worker.execute(() -> {                          // load the depth network off the render thread
-                    try { depth = new Depth(asset("depth.onnx"), 4); }
+                if (S.depthOn) loadDepth();
+            t0 = System.nanoTime();
+            while (!quit) frame();
+        } catch (Throwable e) {
+            status = "render error: " + e;
+        } finally { cleanup(); }
+    }
+
+    boolean depthRequested = false; long lastDepthStart = 0;
+    void loadDepth() {
+            if (depthRequested) return;
+            depthRequested = true;
+            worker.execute(() -> {                          // load the depth network off the render thread
+                    try { depth = new Depth(asset("depth.onnx"), 2); }
                     catch (Throwable e) { depthErr = String.valueOf(e.getMessage()); }
                 });
-                t0 = System.nanoTime();
-                while (!quit) frame();
-            } catch (Throwable e) {
-                status = "render error: " + e;
-            } finally {
+    }
+
+    void cleanup() {
+            {
                 worker.shutdownNow();
                 if (cap != null) cap.release();
                 if (st != null) st.release();
@@ -288,7 +299,7 @@ public class Bridge extends Service {
             long now = System.nanoTime();
             if (now - t0 > 1_000_000_000L) {
                 float sec = (now - t0) / 1e9f;
-                String ds = depthErr != null ? "depth failed: " + depthErr : d == null ? "depth loading" : "depth " + d.lastMs + " ms";
+                String ds = !S.depthOn ? "3D off (Options to turn on)" : depthErr != null ? "depth failed: " + depthErr : d == null ? "depth loading" : "depth " + d.lastMs + " ms";
                 status = String.format(Locale.US, "running: headset %.0f fps, game frames %.0f/s, capture %dx%d, %s",
                     frames / sec, captured / sec, capW, capH, ds);
                 frames = 0; captured = 0; t0 = now;
@@ -296,8 +307,12 @@ public class Bridge extends Service {
         }
 
         void feedDepth() {
+            if (!S.depthOn) return;
+            if (!depthRequested) { loadDepth(); return; }
             final Depth d = depth;
-            if (d == null || depthBusy || !S.depthOn) return;
+            long nowMs = android.os.SystemClock.uptimeMillis();
+            if (d == null || depthBusy || nowMs - lastDepthStart < 250) return;   // at most 4 depth updates a second
+            lastDepthStart = nowMs;
             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fbo);
             GLES30.glViewport(0, 0, Depth.RW, Depth.RH);
             GLES30.glUseProgram(progSmall);

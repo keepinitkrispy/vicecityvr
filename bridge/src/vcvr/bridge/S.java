@@ -14,16 +14,16 @@ final class S {
     static final int STR = 0, CONV = 1, NEAR = 2, SCREEN = 3, K1 = 4, K2 = 5, LX = 6, LY = 7, RX = 8, RY = 9, ESC = 10;
 
     static final float[] v = DEF.clone();
-    static volatile boolean depthOn = true, lensOn = true, swap = false;
+    static volatile boolean depthOn = false, lensOn = true, swap = false;
 
     static void load(SharedPreferences p) {
         for (int i = 0; i < KEY.length; i++) v[i] = p.getFloat(KEY[i], DEF[i]);
-        depthOn = p.getBoolean("depth", true); lensOn = p.getBoolean("lens", true); swap = p.getBoolean("swap", false);
+        depthOn = p.getBoolean("depth4", false); lensOn = p.getBoolean("lens", true); swap = p.getBoolean("swap", false);
     }
 
     static void save(SharedPreferences p) {
         SharedPreferences.Editor e = p.edit();
         for (int i = 0; i < KEY.length; i++) e.putFloat(KEY[i], v[i]);
-        e.putBoolean("depth", depthOn).putBoolean("lens", lensOn).putBoolean("swap", swap).apply();
+        e.putBoolean("depth4", depthOn).putBoolean("lens", lensOn).putBoolean("swap", swap).apply();
     }
 }
