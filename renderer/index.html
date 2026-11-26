@@ -649,7 +649,7 @@ function frame(now) {
   // head pose
   let q;
   if (pose) {
-    const age = (now - poseT) / 1000 + S.predict / 1000, w = pose.w;
+    const age = Math.max(0, Math.min(0.05, (now - poseT) / 1000 + S.predict / 1000)), w = pose.w; // cap stale-pose extrapolation at 50 ms
     q = qn(qmul(pose.q, [1, w[0] * age / 2, w[1] * age / 2, w[2] * age / 2]));
   } else q = qmul(qaxis(0, 1, 0, -dragYaw), qaxis(1, 0, 0, -dragPitch));
   if (S.invyaw) q[2] = -q[2]; if (S.invpitch) q[1] = -q[1]; if (S.invroll) q[3] = -q[3];
