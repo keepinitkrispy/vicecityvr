@@ -1,0 +1,26 @@
+name: Bodycam camera checks
+on:
+  push:
+    branches: [bodycam-cloud-pcvr]
+  workflow_dispatch:
+jobs:
+  camera:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Camera response regression
+        run: node cloud/bodycam-camera.test.mjs
+      - name: Renderer wiring sanity
+        run: |
+          node --input-type=module <<'EOF'
+          import fs from 'node:fs';
+          import assert from 'node:assert/strict';
+          const html=fs.readFileSync('renderer/index.html','utf8');
+          assert.match(html,/import\('\.\.\/cloud\/bodycam-camera\.mjs'\)/);
+          assert.match(html,/if \(S\.bodycam\)/);
+          assert.match(html,/cameraLagYaw/);
+          console.log('Renderer camera wiring checks passed');
+          EOF
