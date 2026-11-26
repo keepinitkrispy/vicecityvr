@@ -1,0 +1,15 @@
+import assert from 'node:assert/strict';
+import {BodycamCamera} from './bodycam-camera.mjs';
+const c=new BodycamCamera();
+let p=c.update({dt:1/60,stickX:1,stickY:-1,headYaw:0.2,headPitch:0.1});
+assert.ok(p.cameraLagYaw<=0 && p.cameraLagYaw>=-0.055);
+assert.ok(p.cameraLagPitch<=0 && p.cameraLagPitch>=-0.035);
+assert.equal(p.yaw,0.2+p.cameraLagYaw);
+assert.equal(p.pitch,0.1+p.cameraLagPitch);
+for(let i=0;i<120;i++) p=c.update({dt:1/60});
+assert.ok(Math.abs(p.cameraLagYaw)<1e-6);
+assert.ok(Math.abs(p.cameraLagPitch)<1e-6);
+c.reset();
+assert.equal(c.update({dt:0}).cameraLagYaw,0);
+assert.throws(()=>c.update({dt:-1}),/Invalid dt/);
+console.log('Bodycam camera response checks passed');
