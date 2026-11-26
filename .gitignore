@@ -1,7 +1,0 @@
-calibrate/build/
-calibrate/*.apk
-calibrate/*.idsig
-native/psvrctl
-models/
-*.onnx
-__pycache__/

@@ -1,5 +1,0 @@
-build/
-deps/
-assets/depth.onnx
-vcvr-bridge.apk
-*.idsig
