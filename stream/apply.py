@@ -105,4 +105,147 @@ edit("android/app/src/main/java/com/metallic/chiaki/stream/VideoRenderer.kt", " 
 edit("android/app/src/main/java/com/metallic/chiaki/stream/VideoRenderer.kt", "            drawPass(stereo,0,surfaceWidth,surfaceHeight,GLES30.GL_TEXTURE_2D,frame) {", "            updateResponse(pending>0)\n            drawPass(stereo,0,surfaceWidth,surfaceHeight,GLES11Ext.GL_TEXTURE_EXTERNAL_OES,oesTextureId) {")
 edit("android/app/src/main/java/com/metallic/chiaki/stream/VideoRenderer.kt", "                GLES30.glUniform2f(stereo.uniformLoc(\"u_Picture\"),videoWidth*fit,videoHeight*fit)", "                GLES30.glUniform2f(stereo.uniformLoc(\"u_Picture\"),videoWidth*fit,videoHeight*fit)\n                GLES30.glUniformMatrix4fv(stereo.uniformLoc(\"u_STMatrix\"),1,false,stMatrix,0)\n                GLES30.glActiveTexture(GLES30.GL_TEXTURE1)\n                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D,responseFrames?.get(previousResponse)?.textureId ?: 0)\n                GLES30.glUniform1i(stereo.uniformLoc(\"u_Response\"),1)\n                GLES30.glUniform1f(stereo.uniformLoc(\"u_Ready\"),if(haveResponse)1f else 0f)\n                GLES30.glUniform1f(stereo.uniformLoc(\"u_Swap\"),if(cal.swap)1f else 0f)\n                GLES30.glUniform2f(stereo.uniformLoc(\"u_Texel\"),1f/videoWidth,1f/videoHeight)\n                GLES30.glActiveTexture(GLES30.GL_TEXTURE0)")
 edit("android/app/src/main/java/com/metallic/chiaki/stream/VideoRenderer.kt", "                float d=texture(u_Response,src).a;", "                float d=u_Ready>.5 ? texture(u_Response,src).a : .46;")
+
+# --- accelerator-only neural stereo, with existing GPU response as fallback ---
+from pathlib import Path
+import urllib.request
+depth_src = Path(HERE).parent / 'bridge/src/vcvr/bridge/Depth.java'
+depth_dst = Path(M) / (KT + 'stream/Depth.java')
+depth_code = depth_src.read_text().replace('package vcvr.bridge;', 'package com.metallic.chiaki.stream;')
+depth_code = depth_code.replace('RW = 532, RH = 308', 'RW = 266, RH = 154')
+depth_code = depth_code.replace('sess = env.createSession(model, so);', '''try {
+            so.addNnapi(java.util.EnumSet.of(ai.onnxruntime.providers.NNAPIFlags.CPU_DISABLED));
+            so.addConfigEntry("session.disable_cpu_ep_fallback", "1");
+            sess = env.createSession(model, so);
+        } finally { so.close(); }''')
+depth_dst.write_text(depth_code, encoding='utf-8')
+model = Path(M) / 'android/app/src/main/assets/depth.onnx'
+model.parent.mkdir(parents=True, exist_ok=True)
+if not model.exists():
+    urllib.request.urlretrieve('https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model_quantized.onnx', str(model))
+edit('android/app/build.gradle', 'dependencies {\n    implementation fileTree', "dependencies {\n    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.22.0'\n    implementation fileTree")
+edit(KT+'stream/PsvrOutput.kt', 'val renderer = VideoRenderer(width,height,false,0f,null,{ glView.requestRender() },onSurface)', 'val renderer = VideoRenderer(width,height,false,0f,null,{ glView.requestRender() },onSurface).also { it.neuralContext = activity.applicationContext }')
+edit(KT+'stream/VideoRenderer.kt', '    private var flowProgram: Program?=null', '''    var neuralContext: Context? = null
+    private val neuralBusy = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val neuralWorker = java.util.concurrent.Executors.newSingleThreadExecutor()
+    @Volatile private var neuralEngine: Depth? = null
+    @Volatile private var neuralDisabled = false
+    @Volatile private var neuralClosed = false
+    @Volatile private var nextNeuralMs = 0L
+    private var neuralTarget: RenderTarget? = null
+    private var neuralBuffer: ByteBuffer? = null
+    private var neuralUpload: ByteBuffer? = null
+    private var neuralTexture = 0
+    private var neuralStamp = 0L
+    private var thermal = 0
+    private var thermalStamp = 0L
+    private val neuralCrop = floatArrayOf(0f,0f,1f,1f)
+    private fun prepareNeural() {
+        if(neuralContext == null) return
+        neuralTarget = createRenderTarget(Depth.RW,Depth.RH)
+        neuralBuffer = ByteBuffer.allocateDirect(Depth.RW*Depth.RH*4)
+        neuralUpload = ByteBuffer.allocateDirect(Depth.W*Depth.H*2)
+        val ids=IntArray(1)
+        GLES30.glGenTextures(1,ids,0)
+        neuralTexture=ids[0]
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D,neuralTexture)
+        GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D,0,GLES30.GL_RG8,Depth.W,Depth.H,0,GLES30.GL_RG,GLES30.GL_UNSIGNED_BYTE,null)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D,GLES30.GL_TEXTURE_MIN_FILTER,GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D,GLES30.GL_TEXTURE_MAG_FILTER,GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D,GLES30.GL_TEXTURE_WRAP_S,GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D,GLES30.GL_TEXTURE_WRAP_T,GLES30.GL_CLAMP_TO_EDGE)
+        neuralStamp=0L
+        nextNeuralMs=android.os.SystemClock.elapsedRealtime()+5000L
+    }
+    private fun updateNeural(hasFrame:Boolean) {
+        val ctx=neuralContext?:return
+        val target=neuralTarget?:return
+        val buf=neuralBuffer?:return
+        val upload=neuralUpload?:return
+        val now=android.os.SystemClock.elapsedRealtime()
+        if(now-thermalStamp>=1000L) {
+            thermalStamp=now
+            if(android.os.Build.VERSION.SDK_INT>=29)
+                thermal=ctx.getSystemService(android.os.PowerManager::class.java)?.currentThermalStatus?:0
+        }
+        if(neuralDisabled || neuralClosed || thermal>=2) return
+        val engine=neuralEngine
+        if(engine!=null && engine.fresh) {
+            synchronized(engine) {
+                upload.clear(); upload.put(engine.shift); upload.flip()
+                engine.crop.copyInto(neuralCrop); engine.fresh=false
+            }
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D,neuralTexture)
+            GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D,0,0,0,Depth.W,Depth.H,GLES30.GL_RG,GLES30.GL_UNSIGNED_BYTE,upload)
+            neuralStamp=now
+        }
+        if(!hasFrame || now<nextNeuralMs || !neuralBusy.compareAndSet(false,true)) return
+        try {
+            // Initialize on the worker before copying any frame. No CPU fallback.
+            if(engine==null) {
+                neuralWorker.execute {
+                    try {
+                        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                        neuralEngine=Depth(ctx.assets.open("depth.onnx").use { it.readBytes() },1)
+                        Log.i(TAG,"Accelerator-only depth session ready")
+                    } catch(e:Exception) { neuralDisabled=true; Log.w(TAG,"Accelerated depth unavailable; GPU stereo retained",e) }
+                    catch(e:LinkageError) { neuralDisabled=true; Log.w(TAG,"Neural runtime unavailable",e) }
+                    finally { nextNeuralMs=android.os.SystemClock.elapsedRealtime()+1000L; neuralBusy.set(false) }
+                }
+                return
+            }
+            drawPass(copyProgram,target.fboId,Depth.RW,Depth.RH,GLES11Ext.GL_TEXTURE_EXTERNAL_OES,oesTextureId) {
+                GLES30.glUniformMatrix4fv(uCopySTMatrixLoc,1,false,stMatrix,0)
+            }
+            buf.clear()
+            GLES30.glReadPixels(0,0,Depth.RW,Depth.RH,GLES30.GL_RGBA,GLES30.GL_UNSIGNED_BYTE,buf)
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER,0)
+            neuralWorker.execute {
+                val start=android.os.SystemClock.elapsedRealtime()
+                try {
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                    engine.load(buf); engine.process(.022f,.5f,.9f)
+                    if(android.os.SystemClock.elapsedRealtime()-start>750L) neuralDisabled=true
+                } catch(e:Exception) { neuralDisabled=true; Log.w(TAG,"Depth inference failed; GPU stereo retained",e) }
+                catch(e:LinkageError) { neuralDisabled=true }
+                finally {
+                    val end=android.os.SystemClock.elapsedRealtime()
+                    nextNeuralMs=end+maxOf(500L,(end-start)*4L)
+                    neuralBusy.set(false)
+                }
+            }
+        } catch(e:RuntimeException) { neuralDisabled=true; neuralBusy.set(false); Log.w(TAG,"Depth scheduling failed",e) }
+    }
+    private var flowProgram: Program?=null''')
+edit(KT+'stream/VideoRenderer.kt', 'else prepareResponse()', 'else { prepareResponse(); prepareNeural() }')
+edit(KT+'stream/VideoRenderer.kt', '            updateResponse(pending>0)', '            updateResponse(pending>0)\n            updateNeural(pending>0)')
+edit(KT+'stream/VideoRenderer.kt', '            uniform sampler2D u_Response;', '''            uniform sampler2D u_Response;
+            uniform sampler2D u_Neural;
+            uniform vec4 u_NeuralCrop;
+            uniform float u_NeuralWeight;''')
+edit(KT+'stream/VideoRenderer.kt', '                src.x+=sg*.022*(d-.46)*taper*u_Ready;', '''                float motionShift=sg*.022*(d-.46)*taper*u_Ready;
+                vec2 local=(src-u_NeuralCrop.xy)/max(u_NeuralCrop.zw-u_NeuralCrop.xy,vec2(.0001));
+                float offset=motionShift;
+                if(u_NeuralWeight>.001 && all(greaterThanEqual(local,vec2(0.))) && all(lessThanEqual(local,vec2(1.)))) {
+                    vec2 shifts=texture(u_Neural,local).rg;
+                    float ns=((left?shifts.r:shifts.g)-128./255.)*.16*(u_NeuralCrop.z-u_NeuralCrop.x)*taper;
+                    offset=mix(motionShift,clamp(ns,-.025,.025),u_NeuralWeight);
+                }
+                src.x+=offset;''')
+edit(KT+'stream/VideoRenderer.kt', '                GLES30.glUniform1i(stereo.uniformLoc("u_Response"),1)', '''                GLES30.glUniform1i(stereo.uniformLoc("u_Response"),1)
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D,neuralTexture)
+                GLES30.glUniform1i(stereo.uniformLoc("u_Neural"),2)
+                GLES30.glUniform4f(stereo.uniformLoc("u_NeuralCrop"),neuralCrop[0],neuralCrop[1],neuralCrop[2],neuralCrop[3])
+                val age=android.os.SystemClock.elapsedRealtime()-neuralStamp
+                val weight=if(neuralStamp!=0L && !neuralDisabled && thermal<2) ((1500L-age)/750f).coerceIn(0f,1f) else 0f
+                GLES30.glUniform1f(stereo.uniformLoc("u_NeuralWeight"),weight)''')
+edit(KT+'stream/VideoRenderer.kt', '    fun release() {\n        surface?.release()', '''    fun release() {
+        neuralClosed=true
+        if(!neuralWorker.isShutdown) {
+            neuralWorker.execute { try { neuralEngine?.sess?.close() } catch(_:Exception) {} }
+            neuralWorker.shutdown()
+        }
+        surface?.release()''')
+
 print('apply.py: all edits applied')
