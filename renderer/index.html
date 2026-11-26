@@ -93,6 +93,7 @@ window.SCHEMA = [
   ['ryo',     'Right eye Y (px)',            -490, 490,  1,    0,    'Per-eye (from PSVR Alignment app)'],
   ['rsc',     'Right eye scale',             0.5,  1.6,  0.001,1,    'Per-eye (from PSVR Alignment app)'],
 
+  ['bodycam', 'Bodycam camera response (opt-in)', 0, 1, 1, 0, 'Tracking'],
   ['predict', 'Head prediction (ms)',        0,    60,   1,    22,   'Tracking'],
   ['neck',    'Neck model',                  0,    1,    1,    1,    'Tracking'],
   ['invyaw',  'Invert yaw',                  0,    1,    1,    0,    'Tracking'],
@@ -628,6 +629,20 @@ function screenGeom() {
 
 // ------------------------------------------------------------------ frame loop
 let screenYaw = 0, lastT = performance.now(), frames = 0, fpsT = performance.now();
+// Lazy module loading keeps the original renderer usable if the optional module fails.
+let bodycamCamera = null;
+import('../cloud/bodycam-camera.mjs').then(({BodycamCamera}) => {
+  bodycamCamera = new BodycamCamera();
+}).catch(err => console.warn('Bodycam camera unavailable; normal tracking retained', err));
+function bodycamStick() {
+  const pads = navigator.getGamepads?.() || [];
+  for (const pad of pads) {
+    if (!pad || !pad.connected || pad.axes.length < 4) continue;
+    const dead = v => Math.abs(v) < 0.12 ? 0 : Math.max(-1, Math.min(1, v));
+    return [dead(pad.axes[2]), dead(pad.axes[3])];
+  }
+  return [0, 0];
+}
 function frame(now) {
   requestAnimationFrame(frame);
   const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
@@ -655,6 +670,16 @@ function frame(now) {
   if (S.invyaw) q[2] = -q[2]; if (S.invpitch) q[1] = -q[1]; if (S.invroll) q[3] = -q[3];
   lastRawQ = q;
   q = qn(qmul(recenterQ, q));
+  // Bodycam inertia is a shared view adjustment, never a separate per-eye rotation.
+  // Default off: do not alter existing headset behavior until explicitly enabled.
+  if (bodycamCamera) {
+    const [stickX, stickY] = S.bodycam ? bodycamStick() : [0, 0];
+    const lag = bodycamCamera.update({dt, stickX, stickY});
+    if (S.bodycam) {
+      q = qn(qmul(q, qmul(qaxis(0, 1, 0, lag.cameraLagYaw),
+                            qaxis(1, 0, 0, lag.cameraLagPitch))));
+    }
+  }
   const Rm = qmat(q);
   // lazy-follow screen
   if (S.follow > 0) {
