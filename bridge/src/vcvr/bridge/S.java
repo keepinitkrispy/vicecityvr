@@ -8,7 +8,7 @@ final class S {
     static final String[] NAME = {"3D strength", "Screen depth plane", "Near limit", "Screen size",
         "Lens k1", "Lens k2", "Left eye X", "Left eye Y", "Right eye X", "Right eye Y", "Eye image size"};
     static final String[] KEY = {"str", "conv", "near", "screen", "k1", "k2", "lx", "ly", "rx", "ry", "esc"};
-    static final float[] DEF = {0.025f, 0.35f, 0.92f, 0.78f, 0.22f, 0.24f, 0, 0, 0, 0, 1f};
+    static final float[] DEF = {0.04f, 0.35f, 0.92f, 0.78f, 0.22f, 0.24f, 0, 0, 0, 0, 1f};
     static final float[] MIN = {0f, 0f, 0.3f, 0.3f, 0f, 0f, -200, -200, -200, -200, 0.6f};
     static final float[] MAX = {0.07f, 1f, 1f, 1.3f, 0.6f, 0.6f, 200, 200, 200, 200, 1.4f};
     static final int STR = 0, CONV = 1, NEAR = 2, SCREEN = 3, K1 = 4, K2 = 5, LX = 6, LY = 7, RX = 8, RY = 9, ESC = 10;

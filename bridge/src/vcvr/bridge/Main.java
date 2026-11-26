@@ -67,7 +67,7 @@ public class Main extends Activity {
         col.addView(reset);
         col.addView(text("\nOpening this app starts everything: headset VR mode, capture, then Momiji.\n" +
             "First time only: allow Shizuku, and tick \"always\" if Android asks about the headset USB.\n" +
-            "Come back here any time to adjust; changes show in the headset immediately.", 14));
+            "In the game: press BOTH sticks (L3+R3) to adjust in the headset; press both again to go back.", 14));
         ScrollView sc = new ScrollView(this); sc.addView(col); setContentView(sc);
         IntentFilter f = new IntentFilter(ACTION_USB);
         registerReceiver(usbReceiver, f, Context.RECEIVER_NOT_EXPORTED);
@@ -98,7 +98,7 @@ public class Main extends Activity {
         if (Bridge.running) { launchGame(); return; }
         if (going) return;
         going = true;
-        if (Settings.canDrawOverlays(this) && prefs.getBoolean("projAllowed", false)) { begin(); return; }
+        if (Settings.canDrawOverlays(this) && prefs.getBoolean("grants3", false)) { begin(); return; }
         Bridge.status = "setting up (first run)";
         waitShizuku(0);
     }
@@ -124,9 +124,14 @@ public class Main extends Activity {
         }
         new Thread(() -> {
             String pkg = getPackageName();
-            String out = shell("appops set " + pkg + " SYSTEM_ALERT_WINDOW allow; appops set " + pkg + " PROJECT_MEDIA allow; appops get " + pkg + " PROJECT_MEDIA");
+            String svc = pkg + "/" + pkg + ".Keys";
+            String out = shell("appops set " + pkg + " SYSTEM_ALERT_WINDOW allow; appops set " + pkg + " PROJECT_MEDIA allow; "
+                + "cur=$(settings get secure enabled_accessibility_services); "
+                + "case \"$cur\" in *" + svc + "*) ;; null|'') settings put secure enabled_accessibility_services " + svc + " ;; "
+                + "*) settings put secure enabled_accessibility_services \"$cur:" + svc + "\" ;; esac; "
+                + "settings put secure accessibility_enabled 1; appops get " + pkg + " PROJECT_MEDIA");
             boolean ok = out.contains("allow");
-            prefs.edit().putBoolean("projAllowed", ok).apply();
+            prefs.edit().putBoolean("grants3", ok).apply();
             usbState = ok ? "screen sharing pre-approved through Shizuku" : "Shizuku approval failed: " + out.trim();
             ui.post(this::begin);
         }, "shizuku-grant").start();

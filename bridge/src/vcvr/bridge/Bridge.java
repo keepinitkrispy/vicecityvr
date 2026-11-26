@@ -30,6 +30,10 @@ import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.WindowManager;
+import android.view.Gravity;
+import android.widget.FrameLayout;
+import android.widget.TextView;
+import android.graphics.Color;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
@@ -48,6 +52,7 @@ public class Bridge extends Service {
 
     final Handler main = new Handler(Looper.getMainLooper());
     MediaProjection mp; VirtualDisplay vd; WindowManager wm; SurfaceView sv; Render gl;
+    FrameLayout root; final TextView[] label = new TextView[2]; long startMs;
 
     @Override public IBinder onBind(Intent i) { return null; }
 
@@ -103,8 +108,35 @@ public class Bridge extends Service {
                 | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
             PixelFormat.OPAQUE);
         lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
-        try { wm.addView(sv, lp); status = "starting"; }
+        // text on the headset, one copy per eye: status at start, and the controls while adjusting
+        root = new FrameLayout(wc);
+        root.addView(sv, new FrameLayout.LayoutParams(1920, 1080));
+        for (int i = 0; i < 2; i++) {
+            TextView t = new TextView(wc);
+            t.setTextColor(Color.WHITE); t.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, 22);
+            t.setBackgroundColor(0xB0000000); t.setPadding(12, 8, 12, 8); t.setGravity(Gravity.CENTER);
+            FrameLayout.LayoutParams p = new FrameLayout.LayoutParams(560, FrameLayout.LayoutParams.WRAP_CONTENT);
+            p.leftMargin = i * 960 + 200; p.topMargin = 330;
+            root.addView(t, p); label[i] = t;
+        }
+        startMs = android.os.SystemClock.uptimeMillis();
+        main.post(this::updateLabel);
+        try { wm.addView(root, lp); status = "starting"; }
         catch (Exception e) { status = "cannot draw on the headset: " + e.getMessage(); }
+    }
+
+    void updateLabel() {
+        if (root == null) return;
+        String st = status;
+        boolean early = android.os.SystemClock.uptimeMillis() - startMs < 15000;
+        boolean bad = st.contains("fail") || st.contains("error") || st.contains("loading");
+        String text = Keys.adjust ? Keys.label() + "\n" + st
+            : st + "\nPress BOTH sticks (L3+R3) to adjust" + (Keys.service ? "" : "\n(controller adjust not enabled)");
+        for (TextView t : label) {
+            t.setText(text);
+            t.setVisibility(Keys.adjust || early || bad ? android.view.View.VISIBLE : android.view.View.GONE);
+        }
+        main.postDelayed(this::updateLabel, 250);
     }
 
     // called from the render thread once its capture surface exists
@@ -122,7 +154,8 @@ public class Bridge extends Service {
         running = false;
         if (gl != null) { gl.quit(); gl = null; }
         if (vd != null) { vd.release(); vd = null; }
-        if (sv != null && wm != null) { try { wm.removeView(sv); } catch (Exception ignored) {} sv = null; }
+        if (root != null && wm != null) { try { wm.removeView(root); } catch (Exception ignored) {} root = null; sv = null; }
+        Keys.adjust = false;
         if (mp != null) { MediaProjection m = mp; mp = null; try { m.stop(); } catch (Exception ignored) {} }
         if (!status.startsWith("capture ended") && !status.startsWith("cannot") && !status.startsWith("headset display"))
             status = "stopped";
@@ -157,7 +190,7 @@ public class Bridge extends Service {
         "uniform vec4 crop;      // content region of the captured frame, GL uv (x0,y0,x1,y1)\n" +
         "uniform float aspect;   // content width/height in pixels\n" +
         "uniform vec4 off;       // per-eye offset in panel pixels, y down: lx,ly,rx,ry\n" +
-        "uniform float esc, screen, lens, depthOn, swapEyes;\n" +
+        "uniform float esc, screen, lens, depthOn, swapEyes, xhair;\n" +
         "uniform vec2 k;\n" +
         "out vec4 o;\n" +
         "void main(){\n" +
@@ -166,6 +199,7 @@ public class Bridge extends Service {
         "  vec2 L = vec2(gl_FragCoord.x - (half_*960.0 + 480.0), 540.0 - gl_FragCoord.y);   // panel px from eye centre, y down\n" +
         "  vec2 e = eye < 0.5 ? off.xy : off.zw;\n" +
         "  vec2 q = (L - e) / esc / 540.0;                             // eye image coords, y in [-1,1]\n" +
+        "  if (xhair > 0.5 && (abs(q.x) < 0.003 || abs(q.y) < 0.003)) { o = vec4(0.1,1.0,0.2,1.0); return; }   // eye centre while adjusting\n" +
         "  if (lens > 0.5) { float r2 = dot(q,q); q *= 1.0 + k.x*r2 + k.y*r2*r2; }   // same mapping as the alignment app\n" +
         "  float W = screen * (960.0/540.0), H = W / aspect;           // virtual screen size in eye coords\n" +
         "  vec2 s = vec2(q.x / W + 0.5, 0.5 - q.y / H);               // screen uv, GL orientation\n" +
@@ -307,6 +341,7 @@ public class Bridge extends Service {
             GLES30.glUniform1f(GLES30.glGetUniformLocation(p, "lens"), S.lensOn ? 1 : 0);
             GLES30.glUniform1f(GLES30.glGetUniformLocation(p, "depthOn"), S.depthOn && depthReady ? 1 : 0);
             GLES30.glUniform1f(GLES30.glGetUniformLocation(p, "swapEyes"), S.swap ? 1 : 0);
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(p, "xhair"), Keys.adjust ? 1 : 0);
             quad();
         }
 
