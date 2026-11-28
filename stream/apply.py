@@ -306,9 +306,7 @@ edit(activity_file, '\tprivate var psvrOutput: PsvrOutput? = null', '''    priva
             // Move the running decoder to the phone surface first (AMediaCodec_setOutputSurface), then
             // release the headset's. Detaching would shut the decoder down, and a new decoder fed only
             // P-frames shows a frozen picture until the PS5 happens to send a keyframe.
-            val phone = videoRenderer?.outputSurface ?: binding.surfaceView.holder.surface
-            if (phone != null && phone.isValid) viewModel.session.attachToSurface(phone)
-            else viewModel.session.detachSurface()
+            viewModel.session.headsetSurface = null
             current.releaseOutput()
             psvrAlignButton?.let { binding.root.removeView(it) }
             psvrAlignButton = null
@@ -318,7 +316,7 @@ edit(activity_file, '\tprivate var psvrOutput: PsvrOutput? = null', '''    priva
         lateinit var output: PsvrOutput
         output = PsvrOutput(this, display, profile.width, profile.height) { surface ->
             runOnUiThread {
-                if (psvrOutput === output && surface.isValid) viewModel.session.attachToSurface(surface)
+                if (psvrOutput === output && surface.isValid) viewModel.session.headsetSurface = surface
             }
         }
         try {
@@ -344,7 +342,87 @@ edit(activity_file, 'private fun updateSecondScreen()\n\t{', '''private fun upda
         refreshPsvrOutput()''')
 edit(activity_file, '\t\tstarted = true\n\t\tupdateSecondScreen()', '\t\tstarted = true\n\t\tpsvrUsb.start()\n\t\tupdateSecondScreen()')
 edit(activity_file, '\t\tviewModel.session.pause()\n\t\tif (psvrOutput != null)', '\t\tpsvrUsb.stop()\n\t\tviewModel.session.pause()\n\t\tif (psvrOutput != null)')
-edit(video_renderer, '    private var surface: Surface? = null', '''    @Volatile private var surface: Surface? = null
-    val outputSurface: Surface? get() = surface''')
+edit(video_renderer, '    private var surface: Surface? = null', '''    @Volatile private var surface: Surface? = null''')
+
+# While the headset shows the stream, only the headset may hold the decoder. The phone's own views
+# (plain SurfaceView, or the debanding GLSurfaceView) re-attach themselves whenever they are rebuilt,
+# e.g. when the stream shrinks to picture-in-picture, which took the decoder away from the headset and
+# left it showing one frozen frame.
+session_file = KT + 'session/StreamSession.kt'
+edit(session_file, '''	fun attachToSurfaceView(surfaceView: SurfaceView)
+	{
+		surfaceView.holder.addCallback(object: SurfaceHolder.Callback {
+			override fun surfaceCreated(holder: SurfaceHolder)
+			{
+				val surface = holder.surface
+				this@StreamSession.surface = surface
+				session?.setSurface(surface)
+			}
+
+			override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) { }
+
+			override fun surfaceDestroyed(holder: SurfaceHolder)
+			{
+				this@StreamSession.surface = null
+				session?.setSurface(null)
+			}
+		})
+		
+		val surface = surfaceView.holder.surface
+		if (surface?.isValid == true) {
+			this.surface = surface
+			session?.setSurface(surface)
+		}
+	}''', '''	/** Vice City VR: the phone's own video surface, used whenever the headset doesn't show the stream */
+	private var phoneSurface: Surface? = null
+
+	/** Vice City VR: while set, the decoder draws only here; null hands it back to the phone */
+	var headsetSurface: Surface? = null
+		set(value)
+		{
+			field = value
+			val target = value ?: phoneSurface?.takeIf { it.isValid }
+			this.surface = target
+			session?.setSurface(target)
+		}
+
+	private fun usePhoneSurface(surface: Surface?)
+	{
+		phoneSurface = surface
+		if (headsetSurface != null) return
+		this.surface = surface
+		session?.setSurface(surface)
+	}
+
+	fun attachToSurfaceView(surfaceView: SurfaceView)
+	{
+		surfaceView.holder.addCallback(object: SurfaceHolder.Callback {
+			override fun surfaceCreated(holder: SurfaceHolder) = usePhoneSurface(holder.surface)
+
+			override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) { }
+
+			override fun surfaceDestroyed(holder: SurfaceHolder) = usePhoneSurface(null)
+		})
+		
+		val surface = surfaceView.holder.surface
+		if (surface?.isValid == true) usePhoneSurface(surface)
+	}''')
+edit(session_file, '''	fun attachToSurface(surface: Surface)
+	{
+		this.surface = surface
+		session?.setSurface(surface)
+	}
+
+	fun detachSurface()
+	{
+		this.surface = null
+		session?.setSurface(null)
+	}''', '''	fun attachToSurface(surface: Surface) = usePhoneSurface(surface)
+
+	fun detachSurface()
+	{
+		phoneSurface = null
+		headsetSurface = null
+	}''')
 
 print('apply.py: all edits applied')
