@@ -16,15 +16,14 @@ import android.os.SystemClock
 import androidx.core.content.ContextCompat
 
 /**
- * A streaming activity's USB link to the original PSVR processor unit: the VR-mode handshake, then head
- * tracking, "both by distance": within about 20 degrees sideways / 15 up-down the head looks around a screen
- * fixed in space ([head]: yaw and pitch from the screen center, radians, left and up positive, and the screen
- * size), with no stream delay. Looking further turns the game camera toward the gaze ([stick]: right-stick
- * deflection, -1..1, up negative) while the screen eases back in front, until the reticle (the picture's
- * center) is under the gaze. The real right stick still aims on top.
- * Recenter: hold L3 + R3 on the controller for a second ([recenter]), or tap mute on a headset cable remote.
- * Cable remote, where there is one: hold mute 1 s = next look direction setting (normal, left/right flipped,
- * up/down flipped, both), volume up/down = screen size.
+ * A streaming activity's USB link to the original PSVR processor unit: the VR-mode handshake, then head-aim.
+ * The head is the camera: its rotation is sent as right-stick input ([stick], -1..1, up negative) so the game
+ * camera turns with the head as fast as the game allows, and the crosshair is where you face. The picture stays
+ * in front of you; while the game catches up (Remote Play delay) it is shifted with the head ([head]: yaw and
+ * pitch offset in radians, left/up positive, and the screen size), so the world doesn't drag behind your turns.
+ * While aiming (L2, [aiming]) the head lets go and the right stick has the crosshair.
+ * Recenter (level the view): hold L3 + R3 for a second ([recenter]). Tuning, in the phone's Align panel:
+ * camera speed (rad/s the game turns at full stick) and delay (ms until a turn shows in the stream).
  */
 internal class PsvrUsb(private val context: Context, private val changed: () -> Unit,
                        private val head: (Float, Float, Float) -> Unit = { _, _, _ -> },
@@ -122,11 +121,13 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
     // ---- head tracking
     private val prefs = context.getSharedPreferences("psvr_live", Context.MODE_PRIVATE)
     /** Screen width as a multiple of the view's width: above 1 there is picture to look at beyond the edges */
-    @Volatile var screenSize = prefs.getFloat("screen_size", 0.8f)   // the whole picture, HUD corners too, inside the lenses
+    @Volatile var screenSize = prefs.getFloat("screen_size", 0.85f)  // the whole picture, HUD corners too, inside the lenses
         private set
     @Volatile private var recenterRequested = false
     /** Puts the screen straight in front of where the head points now; any thread */
     fun recenter() { recenterRequested = true }
+    /** L2 held: the right stick aims and the head doesn't move the camera; any thread */
+    @Volatile var aiming = false
     /** bit 0: left/right flipped, bit 1: up/down flipped */
     private var lookFlip = prefs.getInt("look_flip", 0)
     private val lookFlipNames = arrayOf("normal", "left/right flipped", "up/down flipped", "both flipped")
@@ -147,9 +148,14 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
         var lastSent = 0L
         var buttons = 0
         var muteDownAt = 0L
-        var turnX = false; var turnY = false
-        val cam = 2.0f   // rad/s the game camera is assumed to turn at full stick
-        fun shape(v: Float) = if (v == 0f) 0f else kotlin.math.sign(v) * (0.2f + 0.8f * kotlin.math.abs(v).coerceAtMost(1f))
+        // camera model: where the game camera points (same frame as the head), and its recent history
+        var camYaw = 0f; var camPitch = 0f; var lastHy = 0f; var lastHp = 0f; var wasAiming = true
+        val histYaw = FloatArray(128); val histPitch = FloatArray(128); var histPos = 0
+        var camSpeed = prefs.getFloat("cam_speed", 4.0f); var delayMs = prefs.getInt("cam_delay_ms", 80)
+        var prefsReadAt = 0L
+        // stick deflection for a fraction of full camera speed: GTA ignores small deflections
+        fun shape(v: Float) = if (kotlin.math.abs(v) < 0.005f) 0f
+            else kotlin.math.sign(v) * (0.15f + 0.85f * kotlin.math.abs(v).coerceAtMost(1f))
         fun s16(i: Int) = ((report[i].toInt() and 0xff) or (report[i + 1].toInt() shl 8)).toShort().toFloat()
         fun u24(i: Int) = (report[i].toInt() and 0xff) or ((report[i + 1].toInt() and 0xff) shl 8) or
             ((report[i + 2].toInt() and 0xff) shl 16)
@@ -204,21 +210,37 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                 if (calibrated && t - lastSent >= 4) {
                     val dtc = (t - lastSent).coerceAtMost(50L) / 1000f
                     lastSent = t
+                    if (t - prefsReadAt > 500) {                                  // tuning from the Align panel
+                        prefsReadAt = t
+                        camSpeed = prefs.getFloat("cam_speed", 4.0f); delayMs = prefs.getInt("cam_delay_ms", 80)
+                    }
                     val sx = if (lookFlip and 1 != 0) -1f else 1f
                     val sp = if (lookFlip and 2 != 0) -1f else 1f
-                    var y = sx * yaw; var p = sp * (pitch - pitchZero)
-                    // past the comfort zone the camera turns toward the gaze and the screen follows,
-                    // until the reticle is under the gaze again (then small looks are free again)
-                    if (!turnX && kotlin.math.abs(y) > 0.35f) turnX = true
-                    else if (turnX && kotlin.math.abs(y) < 0.035f) turnX = false
-                    if (!turnY && kotlin.math.abs(p) > 0.26f) turnY = true
-                    else if (turnY && kotlin.math.abs(p) < 0.035f) turnY = false
-                    val rx = if (turnX) (y * 3f).coerceIn(-cam, cam) else 0f
-                    val ry = if (turnY) (p * 3f).coerceIn(-cam, cam) else 0f
-                    yaw -= sx * rx * dtc; pitchZero += sp * ry * dtc
-                    y -= rx * dtc; p -= ry * dtc
-                    stick(shape(-rx / cam), shape(-ry / cam))
-                    head(y, p, screenSize)
+                    val hy = sx * yaw; val hp = sp * (pitch - pitchZero)
+                    if (aiming) {                                                 // the stick has the crosshair
+                        wasAiming = true
+                        stick(0f, 0f); head(0f, 0f, screenSize)
+                        lastHy = hy; lastHp = hp
+                        continue
+                    }
+                    if (wasAiming) {                                              // the camera points where you face now
+                        wasAiming = false
+                        camYaw = hy; camPitch = hp; lastHy = hy; lastHp = hp
+                        histYaw.fill(hy); histPitch.fill(hp)
+                    }
+                    // turn rate: the head's own rate, plus catching up whatever the game hasn't turned yet
+                    val wy = ((hy - lastHy) / dtc + (hy - camYaw) * 6f).coerceIn(-camSpeed, camSpeed)
+                    val wp = ((hp - lastHp) / dtc + (hp - camPitch) * 6f).coerceIn(-camSpeed, camSpeed)
+                    lastHy = hy; lastHp = hp
+                    camYaw += wy * dtc; camPitch = (camPitch + wp * dtc).coerceIn(-1.3f, 1.3f)
+                    // looking left = stick left (negative); looking up = stick up (negative)
+                    stick(shape(-wy / camSpeed), shape(-wp / camSpeed))
+                    // the stream shows the camera as it was [delayMs] ago: shift the picture by what is still missing
+                    histPos = (histPos + 1) % histYaw.size
+                    histYaw[histPos] = camYaw; histPitch[histPos] = camPitch
+                    val back = (delayMs / 4).coerceIn(0, histYaw.size - 1)
+                    val then = (histPos - back + histYaw.size) % histYaw.size
+                    head((hy - histYaw[then]).coerceIn(-0.4f, 0.4f), (hp - histPitch[then]).coerceIn(-0.4f, 0.4f), screenSize)
                 }
             }
         } finally {

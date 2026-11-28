@@ -139,6 +139,17 @@ class PsvrOutput(private val activity: Activity, display: Display, width: Int, h
         row("Smaller" to {change(mult=if(step==2f).996f else .98f)}, "Down" to {change(dy=step)}, "Larger" to {change(mult=if(step==2f)1.004f else 1.02f)})
         row("Reset eye" to {apply(calibration.withEye(eye,PsvrEye()));refresh()}, "Swap" to {apply(calibration.copy(swap=!calibration.swap));refresh()},
             "Lens" to {apply(calibration.copy(warp=!calibration.warp));refresh()})
+        fun tune(key: String, label: String, factor: Float, default: Float, min: Float, max: Float) {
+            val v = (prefs.getFloat(key, default) * factor).coerceIn(min, max)
+            prefs.edit().putFloat(key, v).apply(); status.text = "$label ${"%.1f".format(java.util.Locale.US, v)}"
+        }
+        fun tuneDelay(delta: Int) {
+            val v = (prefs.getInt("cam_delay_ms", 80) + delta).coerceIn(0, 400)
+            prefs.edit().putInt("cam_delay_ms", v).apply(); status.text = "Delay $v ms"
+        }
+        row("Camera slower" to { tune("cam_speed", "Camera speed", 1f / 1.15f, 4f, 0.5f, 20f) },
+            "Camera faster" to { tune("cam_speed", "Camera speed", 1.15f, 4f, 0.5f, 20f) })
+        row("Delay -10 ms" to { tuneDelay(-10) }, "Delay +10 ms" to { tuneDelay(10) })
         row("Import saved alignment" to {
             val c=imported()
             if(c!=null){apply(c);refresh()}else android.widget.Toast.makeText(activity,"Alignment app does not expose saved values yet",android.widget.Toast.LENGTH_LONG).show()

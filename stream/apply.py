@@ -555,6 +555,13 @@ edit(input_file, '''		// After sending, so the released buttons of the menu are 
 	}''', '''		// After sending, so the released buttons of the menu are the last state the console gets
 		if(comboPressed)
 			menuComboCallback?.invoke()
+		// Vice City VR: L2 held = aiming, the right stick takes the crosshair back from the head
+		val aimingNow = state.l2State.toInt() > 40
+		if(aimingNow != aimingLast)
+		{
+			aimingLast = aimingNow
+			aimCallback?.invoke(aimingNow)
+		}
 		val recenterHeld = state.buttons and RECENTER_COMBO == RECENTER_COMBO
 		if(recenterHeld && !recenterPending)
 		{
@@ -568,6 +575,10 @@ edit(input_file, '''		// After sending, so the released buttons of the menu are 
 		}
 	}
 
+	/** Vice City VR: called when aiming (L2) starts or ends */
+	var aimCallback: ((Boolean) -> Unit)? = null
+	private var aimingLast = false
+
 	/** Vice City VR: called when L3 + R3 have been held for a second */
 	var recenterCallback: (() -> Unit)? = null
 	private val RECENTER_COMBO = ControllerState.BUTTON_L3 or ControllerState.BUTTON_R3
@@ -575,7 +586,8 @@ edit(input_file, '''		// After sending, so the released buttons of the menu are 
 	private val recenterHandler = android.os.Handler(android.os.Looper.getMainLooper())
 	private val recenterCheck = Runnable { if(recenterPending) recenterCallback?.invoke() }''')
 edit(activity_file, '''		viewModel.input.menuComboCallback = { showStreamMenu() }''', '''		viewModel.input.menuComboCallback = { showStreamMenu() }
-		viewModel.input.recenterCallback = { psvrUsb.recenter() }''')
+		viewModel.input.recenterCallback = { psvrUsb.recenter() }
+		viewModel.input.aimCallback = { psvrUsb.aiming = it }''')
 
 # Head-driven camera turns (looking past the comfort zone): a right-stick state of its own, merged like every
 # input source (the larger deflection wins), so the real right stick still aims.
