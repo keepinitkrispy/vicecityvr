@@ -3,7 +3,7 @@
 name: stream-app
 on:
   push:
-    branches: [main, 'codex/psvr-*']
+    branches: [main, 'codex/psvr-*', 'ccr-*']
     paths: ['stream/**', '.github/workflows/stream.yml']
   workflow_dispatch:
 permissions:
@@ -71,12 +71,9 @@ jobs:
           make -j"$(nproc)" && make install
 
       - name: Apply Vice City VR changes
-        run: |
-          python3 stream/apply.py momiji
-          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
-            sed -i 's/applicationId "io.github.keepinitkrispy.vicecityvr"/applicationId "io.github.keepinitkrispy.vicecityvr.alignment"/' momiji/android/app/build.gradle
-            sed -i 's/>Vice City VR</>Vice City VR Alignment</' momiji/android/app/src/main/res/values/strings.xml
-          fi
+        # Same app id on every branch: the alignment app only shares calibration with this id,
+        # and the shared debug key lets a test build install over the release one (and back).
+        run: python3 stream/apply.py momiji
 
       - name: Build APK
         env:
@@ -88,25 +85,18 @@ jobs:
           cd momiji/android && chmod +x gradlew && ./gradlew --no-daemon assembleFdroidDebug
           ls -la app/build/outputs/apk/fdroid/debug/
 
-      - name: Upload APK for testing
-        if: github.ref != 'refs/heads/main'
-        uses: actions/upload-artifact@v4
-        with:
-          name: vicecityvr-stream
-          path: momiji/android/app/build/outputs/apk/fdroid/debug/*.apk
-          if-no-files-found: error
-
       - name: Publish APK
-        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # main -> "stream-latest"; any other branch -> "stream-test", so testing never replaces the release
+          TAG=stream-latest; [[ "$GITHUB_REF" == refs/heads/main ]] || TAG=stream-test
           APK=$(ls momiji/android/app/build/outputs/apk/fdroid/debug/*.apk | head -1)
           cp "$APK" vicecityvr-stream.apk
           sha256sum vicecityvr-stream.apk | tee vicecityvr-stream.apk.sha256
-          gh release delete stream-latest --yes --cleanup-tag || true
-          gh release create stream-latest vicecityvr-stream.apk vicecityvr-stream.apk.sha256 --prerelease \
-            --title "Stream app (build ${GITHUB_RUN_NUMBER})" \
+          gh release delete "$TAG" --yes --cleanup-tag || true
+          gh release create "$TAG" vicecityvr-stream.apk vicecityvr-stream.apk.sha256 --prerelease --target "$GITHUB_SHA" \
+            --title "Stream app ${GITHUB_REF_NAME} (build ${GITHUB_RUN_NUMBER})" \
             --notes "Momiji ${MOMIJI_COMMIT} + motion-vector extraction. Built from ${GITHUB_SHA}."
 
       - uses: actions/upload-artifact@v4

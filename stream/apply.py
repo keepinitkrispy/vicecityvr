@@ -89,8 +89,8 @@ edit("android/app/src/main/java/com/metallic/chiaki/stream/VideoRenderer.kt", " 
 edit("android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt", "import android.util.Log", "import android.util.Log\nimport android.view.Gravity\nimport android.view.WindowManager")
 edit("android/app/src/main/cpp/video-decoder.c", "decoder->mv = chiaki_codec_is_h265(codec) ? NULL : mv_extractor_new();", "decoder->mv = NULL;")
 edit("android/app/src/main/res/values/strings.xml", "Motion vectors off: stream is HEVC (choose H.264 in settings)", "Motion vector decoder disabled to conserve power")
-edit("android/app/src/main/java/com/metallic/chiaki/stream/VideoRenderer.kt", "repeat(pending) { _ -> it.updateTexImage() }", "it.updateTexImage()")
-edit("android/app/src/main/java/com/metallic/chiaki/stream/VideoRenderer.kt", "pendingFrames.incrementAndGet()", "pendingFrames.set(1)")
+# (Momiji's latch-every-queued-frame loop stays: latching one buffer per draw lets a backlog build up until
+#  the decoder runs out of buffers and the picture freezes, which is what the heavier headset path triggered.)
 edit("android/app/src/main/java/com/metallic/chiaki/stream/VideoRenderer.kt", "        private const val PSVR_FRAGMENT_SHADER = \"\"\"\n            #version 300 es", "        private const val PSVR_FRAGMENT_SHADER = \"\"\"\n            #version 300 es\n            #extension GL_OES_EGL_image_external_essl3 : require")
 edit("android/app/src/main/java/com/metallic/chiaki/stream/VideoRenderer.kt", "            uniform vec2 u_Picture;\n            void main() {", "            uniform vec2 u_Picture;\n            vec3 sampleGame(vec2 p) {\n                return texture(u_Texture,(u_STMatrix*vec4(clamp(p,0.,1.),0.,1.)).xy).rgb;\n            }\n            void main() {")
 edit("android/app/src/main/java/com/metallic/chiaki/stream/VideoRenderer.kt", "    private fun createRenderTarget(): RenderTarget {", "    private fun createRenderTarget(width:Int=videoWidth,height:Int=videoHeight): RenderTarget {")
@@ -303,12 +303,15 @@ edit(activity_file, '\tprivate var psvrOutput: PsvrOutput? = null', '''    priva
         if (current != null && current.isShowing && current.display.displayId == display?.displayId) return
         if (current != null) {
             psvrOutput = null
-            viewModel.session.detachSurface()
+            // Move the running decoder to the phone surface first (AMediaCodec_setOutputSurface), then
+            // release the headset's. Detaching would shut the decoder down, and a new decoder fed only
+            // P-frames shows a frozen picture until the PS5 happens to send a keyframe.
+            val phone = videoRenderer?.outputSurface ?: binding.surfaceView.holder.surface
+            if (phone != null && phone.isValid) viewModel.session.attachToSurface(phone)
+            else viewModel.session.detachSurface()
             current.releaseOutput()
             psvrAlignButton?.let { binding.root.removeView(it) }
             psvrAlignButton = null
-            val phone = videoRenderer?.outputSurface ?: binding.surfaceView.holder.surface
-            if (phone.isValid) viewModel.session.attachToSurface(phone)
         }
         if (display == null) return
         val profile = viewModel.session.connectInfo.videoProfile
