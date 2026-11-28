@@ -103,8 +103,14 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                 val endpoints = (0 until control.endpointCount).map(control::getEndpoint)
                 val input = endpoints.firstOrNull { it.direction == UsbConstants.USB_DIR_IN } ?: return false
                 val output = endpoints.firstOrNull { it.direction == UsbConstants.USB_DIR_OUT } ?: return false
-                return command(usb, input, output, 0x17, 4) &&
-                    command(usb, input, output, 0x23, 11)
+                // The headset reports its state only when the state changes (plus the reports queued
+                // since the interface was claimed), so read those first: when it is already powered and
+                // in VR mode, a command is only acknowledged (0xA0) and no new report would ever come.
+                val state = Status()
+                read(usb, input, state, 300)
+                if (!state.power && !command(usb, input, output, 0x17, state) { it.power }) return false
+                if (!state.vr && !command(usb, input, output, 0x23, state) { it.vr }) return false
+                return state.power && state.vr
             } finally {
                 usb.releaseInterface(control)
             }
@@ -113,20 +119,32 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
         }
     }
 
-    private fun command(usb: UsbDeviceConnection, input: UsbEndpoint, output: UsbEndpoint,
-                        opcode: Int, statusOffset: Int): Boolean {
-        val packet = byteArrayOf(opcode.toByte(), 0, 0xaa.toByte(), 4, 1, 0, 0, 0)
-        val status = ByteArray(64)
-        repeat(3) {
-            if (usb.bulkTransfer(output, packet, packet.size, 1000) == packet.size) {
-                val deadline = SystemClock.uptimeMillis() + 2000
-                while (SystemClock.uptimeMillis() < deadline) {
-                    if (usb.bulkTransfer(input, status, status.size, 200) == 20 &&
-                        status[0] == 0xf0.toByte() &&
-                        (if (statusOffset == 4) status[4].toInt() and 1 else status[11].toInt()) == 1)
-                        return true
-                }
+    /** Last 0xF0 status report: byte 4 bit 0 = power, byte 11 = 1 in VR mode. */
+    private class Status { var power = false; var vr = false; var seen = false }
+
+    /** Reads reports for [ms] (or until [until] holds), keeping the newest state in [state]. */
+    private fun read(usb: UsbDeviceConnection, input: UsbEndpoint, state: Status, ms: Long,
+                     until: (Status) -> Boolean = { false }): Boolean {
+        val report = ByteArray(64)
+        val deadline = SystemClock.uptimeMillis() + ms
+        while (SystemClock.uptimeMillis() < deadline) {
+            val n = usb.bulkTransfer(input, report, report.size, 200)
+            if (n == 20 && report[0] == 0xf0.toByte()) {
+                state.power = (report[4].toInt() and 1) == 1
+                state.vr = report[11].toInt() == 1
+                state.seen = true
+                if (until(state)) return true
             }
+        }
+        return until(state)
+    }
+
+    private fun command(usb: UsbDeviceConnection, input: UsbEndpoint, output: UsbEndpoint,
+                        opcode: Int, state: Status, done: (Status) -> Boolean): Boolean {
+        val packet = byteArrayOf(opcode.toByte(), 0, 0xaa.toByte(), 4, 1, 0, 0, 0)
+        repeat(3) {
+            if (usb.bulkTransfer(output, packet, packet.size, 1000) == packet.size &&
+                read(usb, input, state, 2000, done)) return true
         }
         return false
     }
