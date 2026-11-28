@@ -150,8 +150,8 @@ class PsvrOutput(private val activity: Activity, display: Display, width: Int, h
         row("Camera slower" to { tune("cam_speed", "Camera speed", 1f / 1.15f, 4f, 0.5f, 20f) },
             "Camera faster" to { tune("cam_speed", "Camera speed", 1.15f, 4f, 0.5f, 20f) })
         row("Delay -10 ms" to { tuneDelay(-10) }, "Delay +10 ms" to { tuneDelay(10) })
-        row("Screen smaller" to { tune("screen_size", "Screen size", 1f / 1.05f, 0.85f, 0.4f, 2.5f) },
-            "Screen larger" to { tune("screen_size", "Screen size", 1.05f, 0.85f, 0.4f, 2.5f) })
+        row("Screen smaller" to { tune("screen_size", "Screen size", 1f / 1.05f, 0.95f, 0.4f, 2.5f) },
+            "Screen larger" to { tune("screen_size", "Screen size", 1.05f, 0.95f, 0.4f, 2.5f) })
         row("Import saved alignment" to {
             val c=imported()
             if(c!=null){apply(c);refresh()}else android.widget.Toast.makeText(activity,"Alignment app does not expose saved values yet",android.widget.Toast.LENGTH_LONG).show()
