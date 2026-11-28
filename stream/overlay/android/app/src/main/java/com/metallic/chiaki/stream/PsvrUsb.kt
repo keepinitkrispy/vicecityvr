@@ -24,13 +24,19 @@ import androidx.core.content.ContextCompat
  * The right stick fine-tunes on top ([userStick]); holding L2 ([aiming]) hands aiming to the right stick alone,
  * and afterwards the head carries on from where you aimed. Right-stick click ([lookBehind]): turn around 180
  * degrees. Level the view: L3 + R3 ([recenter]). Align panel: camera speed, delay, screen size.
+ * [pan]: the stream's whole-picture shift since it started (x, y px, frames), from the encoder's own motion
+ * vectors: compared with the turns sent, it measures the game's real turn speed and the stream's real delay, so
+ * the picture shift and the camera follow use measured values instead of guesses (the Align panel values are
+ * only the starting point). The measurement only tunes; the picture isn't locked to it, so a turning car still
+ * turns your view.
  * [body]: the head's yaw/pitch from straight ahead (radians, left/up positive), for the minimap pinned low-left
  * in front of you, which stays put while the head turns.
  */
 internal class PsvrUsb(private val context: Context, private val changed: () -> Unit,
                        private val head: (Float, Float, Float) -> Unit = { _, _, _ -> },
                        private val stick: (Float, Float) -> Unit = { _, _ -> },
-                       private val body: (Float, Float) -> Unit = { _, _ -> }) {
+                       private val body: (Float, Float) -> Unit = { _, _ -> },
+                       private val pan: (FloatArray) -> Boolean = { false }) {
     private val manager = context.getSystemService(UsbManager::class.java)
     companion object {
         fun permissionAction(context: Context) = context.packageName + ".PSVR_USB_PERMISSION"
@@ -163,7 +169,10 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
         var camYaw = 0f; var camPitch = 0f; var lastHy = 0f; var lastHp = 0f; var wasAiming = true
         var behind = 0f   // 0 or pi: which half of the sphere the head looks around
         var offYaw = 0f; var offPitch = 0f   // the player's stick corrections, kept on top of the head
-        val histYaw = FloatArray(128); val histPitch = FloatArray(128); var histPos = 0
+        val histYaw = FloatArray(512); val histPitch = FloatArray(512); var histPos = 0
+        // measuring the real camera response from the stream's motion vectors
+        val panBuf = FloatArray(3); var panFrames = -1f; var panX = 0f
+        val frameDm = FloatArray(64); val framePos = IntArray(64); var frameN = 0; var learnedAt = 0L
         var camSpeed = prefs.getFloat("cam_speed", 4.0f); var delayMs = prefs.getInt("cam_delay_ms", 80)
         var prefsReadAt = 0L
         // stick deflection for a fraction of full camera speed: GTA ignores small deflections
@@ -224,7 +233,9 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                     lastSent = t
                     if (t - prefsReadAt > 500) {                                  // tuning from the Align panel
                         prefsReadAt = t
-                        camSpeed = prefs.getFloat("cam_speed", 4.0f); delayMs = prefs.getInt("cam_delay_ms", 80)
+                        if (t - learnedAt > 3000) {                               // not being measured: the panel's values
+                            camSpeed = prefs.getFloat("cam_speed", 4.0f); delayMs = prefs.getInt("cam_delay_ms", 80)
+                        }
                         screenSize = prefs.getFloat("screen_size", 0.85f)
                     }
                     val sx = if (lookFlip and 1 != 0) -1f else 1f
@@ -270,6 +281,42 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                     // the stream shows the camera as it was [delayMs] ago: shift the picture by what is still missing
                     histPos = (histPos + 1) % histYaw.size
                     histYaw[histPos] = camYaw; histPitch[histPos] = camPitch
+                    // measure: each new frame's whole-picture shift (displayed radians, + = camera turned left) against
+                    // the turns sent; the lag where they match best is the delay, their ratio corrects the speed
+                    if (pan(panBuf) && panBuf[2] != panFrames) {
+                        val dm = if (panFrames < 0f) 0f else (panBuf[0] - panX) * 1.5708f * screenSize / 1920f
+                        panX = panBuf[0]; panFrames = panBuf[2]
+                        val k = frameN % frameDm.size; frameDm[k] = dm; framePos[k] = histPos; frameN++
+                        val n = kotlin.math.min(frameN, frameDm.size) - 1
+                        fun sent(f: Int, lag: Int): Float {                       // turn sent between two frames, lag ticks earlier
+                            val a = framePos[(f + frameDm.size) % frameDm.size]; val b = framePos[(f - 1 + 2 * frameDm.size) % frameDm.size]
+                            val sz = histYaw.size
+                            return histYaw[((a - lag) % sz + sz) % sz] - histYaw[((b - lag) % sz + sz) % sz]
+                        }
+                        var energy = 0f
+                        for (i in 0 until n) { val v = sent(k - i, delayMs / 4); energy += v * v }
+                        if (n >= 30 && energy > 0.02f) {                           // enough turning to learn from
+                            var bestLag = delayMs / 4; var best = -1e9f
+                            for (lag in 5..60) {                                   // 20..240 ms
+                                var c = 0f
+                                for (i in 0 until n) c += frameDm[(k - i + frameDm.size) % frameDm.size] * sent(k - i, lag)
+                                if (c > best) { best = c; bestLag = lag }
+                            }
+                            var num = 0f; var den = 0f
+                            for (i in 0 until n) {
+                                val s = sent(k - i, bestLag)
+                                num += frameDm[(k - i + frameDm.size) % frameDm.size] * s; den += s * s
+                            }
+                            if (best > 0f && den > 0.01f) {
+                                val ratio = (num / den).coerceIn(0.5f, 2f)       // >1: the game turns faster than assumed
+                                camSpeed = (camSpeed * (1f + 0.1f * (ratio - 1f))).coerceIn(0.5f, 20f)
+                                delayMs = (delayMs + (bestLag * 4 - delayMs) / 5).coerceIn(20, 240)
+                                learnedAt = t
+                                if (frameN % 120 == 0) prefs.edit().putFloat("cam_speed", camSpeed)
+                                    .putInt("cam_delay_ms", delayMs).apply()
+                            }
+                        }
+                    }
                     val back = (delayMs / 4).coerceIn(0, histYaw.size - 1)
                     val then = (histPos - back + histYaw.size) % histYaw.size
                     // a big catch-up (the 180-degree turn) is shown as the stream has it, not shifted

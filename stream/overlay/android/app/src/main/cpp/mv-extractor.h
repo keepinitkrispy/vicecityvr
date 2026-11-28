@@ -21,6 +21,12 @@ void mv_extractor_feed(MvExtractor *mv, const uint8_t *buf, size_t size);
  * out[3] mean motion in px per frame, out[4] frames dropped since last call, out[5] frames processed since last call
  */
 void mv_extractor_stats(MvExtractor *mv, float out[6]);
+/**
+ * Vice City VR head tracking: how far the whole picture has moved since the stream started, from the encoder's
+ * vectors: out[0] x, out[1] y (px of a 1920x1080 frame, content motion: + = right/down; the per-frame shift is
+ * the weighted median over the picture, so HUD and moving objects don't count), out[2] frames analysed.
+ */
+void mv_extractor_pan(MvExtractor *mv, float out[3]);
 /** Latest grid, MV_GRID_W x MV_GRID_H cells of (dx, dy, weight), px per frame, row 0 = top. Returns frame number. */
 uint32_t mv_extractor_field(MvExtractor *mv, float *dst);
 

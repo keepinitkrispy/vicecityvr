@@ -87,8 +87,6 @@ edit("android/app/src/main/java/com/metallic/chiaki/stream/VideoRenderer.kt", " 
 
 # --- PS5-frame-derived response stereo; no AI model, second decoder or GPU readback ---
 edit("android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt", "import android.util.Log", "import android.util.Log\nimport android.view.Gravity\nimport android.view.WindowManager")
-edit("android/app/src/main/cpp/video-decoder.c", "decoder->mv = chiaki_codec_is_h265(codec) ? NULL : mv_extractor_new();", "decoder->mv = NULL;")
-edit("android/app/src/main/res/values/strings.xml", "Motion vectors off: stream is HEVC (choose H.264 in settings)", "Motion vector decoder disabled to conserve power")
 # (Momiji's latch-every-queued-frame loop stays: latching one buffer per draw lets a backlog build up until
 #  the decoder runs out of buffers and the picture freezes, which is what the heavier headset path triggered.)
 edit("android/app/src/main/java/com/metallic/chiaki/stream/VideoRenderer.kt", "        private const val PSVR_FRAGMENT_SHADER = \"\"\"\n            #version 300 es", "        private const val PSVR_FRAGMENT_SHADER = \"\"\"\n            #version 300 es\n            #extension GL_OES_EGL_image_external_essl3 : require")
@@ -297,7 +295,8 @@ edit(activity_file, '\tprivate var psvrOutput: PsvrOutput? = null', '''    priva
     private val psvrUsb by lazy { PsvrUsb(this, ::refreshPsvrOutput,
         head = { yaw, pitch, size -> psvrOutput?.setHead(yaw, pitch, size) },
         stick = { x, y -> viewModel.input.setHeadLook(x, y) },
-        body = { yaw, pitch -> psvrOutput?.setBody(yaw, pitch) }) }
+        body = { yaw, pitch -> psvrOutput?.setBody(yaw, pitch) },
+        pan = { viewModel.session.pan(it) }) }
 
     private fun refreshPsvrOutput() {
         if (!started || isInPictureInPictureMode) return
@@ -672,5 +671,29 @@ edit(input_file, '''		controllerState.also { state -> controllerStateChangedCall
 			else state
 			controllerStateChangedCallback?.invoke(sent)
 		}''')
+
+# Measured camera motion for head tracking: the encoder's own vectors give how far the whole picture moved
+# each frame (H.264 only, so H.264 becomes the default codec).
+edit(CPP + 'chiaki-jni.c', '''	E->SetFloatArrayRegion(env, stats_array, 0, 14, stats);
+}''', '''	E->SetFloatArrayRegion(env, stats_array, 0, 14, stats);
+}
+
+/** Vice City VR: whole-picture shift since the stream started (x, y px, frames analysed); zeros without vectors */
+JNIEXPORT void JNICALL JNI_FCN(sessionGetPan)(JNIEnv *env, jobject obj, jlong ptr, jfloatArray out_array)
+{
+	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
+	float pan[3];
+	mv_extractor_pan(session->video_decoder.mv, pan);
+	E->SetFloatArrayRegion(env, out_array, 0, 3, pan);
+}''')
+edit(KT + 'lib/Chiaki.kt', '''		@JvmStatic external fun sessionGetStats(ptr: Long, stats: FloatArray)''', '''		@JvmStatic external fun sessionGetStats(ptr: Long, stats: FloatArray)
+		@JvmStatic external fun sessionGetPan(ptr: Long, pan: FloatArray)''')
+edit(KT + 'lib/Chiaki.kt', '''	fun getStats(): StreamStats?''', '''	/** Vice City VR: whole-picture shift since the stream started: x, y px, frames analysed */
+	fun getPan(out: FloatArray): Boolean = withNative { ChiakiNative.sessionGetPan(it, out) } != null
+
+	fun getStats(): StreamStats?''')
+edit(KT + 'session/StreamSession.kt', '''	fun stats() = session?.getStats()''', '''	fun stats() = session?.getStats()
+	fun pan(out: FloatArray) = session?.getPan(out) ?: false''')
+edit(KT + 'common/Preferences.kt', '''		val codecDefault = Codec.CODEC_H265''', '''		val codecDefault = Codec.CODEC_H264   // Vice City VR: the head tracking measures camera motion from H.264 vectors''')
 
 print('apply.py: all edits applied')

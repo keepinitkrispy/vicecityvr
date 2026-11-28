@@ -36,7 +36,23 @@ struct MvExtractor {
   // latest field, guarded by lock
   float field[MV_GRID_W * MV_GRID_H * 3];
   uint32_t field_frame;
+  // cumulative whole-picture shift, guarded by lock
+  double pan_x, pan_y;
 };
+
+/** Weighted median of n values (v, w pairs), by sorting a scratch copy; w > 0. */
+static int cmp_vw(const void *a, const void *b) {
+  float x = ((const float *)a)[0], y = ((const float *)b)[0];
+  return (x > y) - (x < y);
+}
+static float weighted_median(float *vw, int n) {
+  if (n <= 0) return 0;
+  qsort(vw, (size_t)n, 2 * sizeof(float), cmp_vw);
+  double total = 0, run = 0;
+  for (int i = 0; i < n; i++) total += vw[i * 2 + 1];
+  for (int i = 0; i < n; i++) { run += vw[i * 2 + 1]; if (run >= total / 2) return vw[i * 2]; }
+  return vw[(n - 1) * 2];
+}
 
 static double thread_ms(void) {
   struct timespec t;
@@ -67,10 +83,22 @@ static void analyse(MvExtractor *mv, const AVFrame *f) {
   }
   for (int i = 0; i < MV_GRID_W * MV_GRID_H; i++)
     if (acc[i * 3 + 2] > 0) { acc[i * 3] /= acc[i * 3 + 2]; acc[i * 3 + 1] /= acc[i * 3 + 2]; }
+  // whole-picture shift of this frame: weighted median of the cells' motion (scaled to a 1920x1080 frame)
+  static float vx[MV_GRID_W * MV_GRID_H * 2], vy[MV_GRID_W * MV_GRID_H * 2];
+  int n = 0;
+  float sx = f->width > 0 ? 1920.0f / (float)f->width : 1.0f, sy = f->height > 0 ? 1080.0f / (float)f->height : 1.0f;
+  for (int i = 0; i < MV_GRID_W * MV_GRID_H; i++)
+    if (acc[i * 3 + 2] > 0) {
+      vx[n * 2] = acc[i * 3] * sx; vx[n * 2 + 1] = acc[i * 3 + 2];
+      vy[n * 2] = acc[i * 3 + 1] * sy; vy[n * 2 + 1] = acc[i * 3 + 2];
+      n++;
+    }
+  float shift_x = n > MV_GRID_W ? weighted_median(vx, n) : 0, shift_y = n > MV_GRID_W ? weighted_median(vy, n) : 0;
   double area = (double)f->width * f->height;
   pthread_mutex_lock(&mv->lock);
   memcpy(mv->field, acc, sizeof acc);
   mv->field_frame++;
+  mv->pan_x += shift_x; mv->pan_y += shift_y;
   mv->cover_sum += area > 0 ? (covered > area ? 1.0 : covered / area) : 0;
   mv->motion_sum += motion_w > 0 ? motion / motion_w : 0;
   pthread_mutex_unlock(&mv->lock);
@@ -172,4 +200,12 @@ uint32_t mv_extractor_field(MvExtractor *mv, float *dst) {
   uint32_t n = mv->field_frame;
   pthread_mutex_unlock(&mv->lock);
   return n;
+}
+
+void mv_extractor_pan(MvExtractor *mv, float out[3]) {
+  out[0] = out[1] = out[2] = 0;
+  if (!mv) return;
+  pthread_mutex_lock(&mv->lock);
+  out[0] = (float)mv->pan_x; out[1] = (float)mv->pan_y; out[2] = (float)mv->field_frame;
+  pthread_mutex_unlock(&mv->lock);
 }
