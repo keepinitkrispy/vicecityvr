@@ -20,7 +20,8 @@ import androidx.core.content.ContextCompat
  * tracking. [head] gets the head's yaw and pitch (radians, left and up positive, 0 = straight at the
  * screen) and the screen size, so the game picture stays fixed in space and turning your head looks
  * across it. The game's camera is never touched: aiming stays on the stick.
- * Headset cable remote: mute = recenter the screen, volume up/down = screen size.
+ * Headset cable remote: tap mute = recenter the screen, hold mute 1 s = next look direction setting
+ * (normal, left/right flipped, up/down flipped, both), volume up/down = screen size.
  */
 internal class PsvrUsb(private val context: Context, private val changed: () -> Unit,
                        private val head: (Float, Float, Float) -> Unit = { _, _, _ -> }) {
@@ -118,6 +119,9 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
     /** Screen width as a multiple of the view's width: above 1 there is picture to look at beyond the edges */
     @Volatile var screenSize = prefs.getFloat("screen_size", 1.3f)
         private set
+    /** bit 0: left/right flipped, bit 1: up/down flipped */
+    private var lookFlip = prefs.getInt("look_flip", 0)
+    private val lookFlipNames = arrayOf("normal", "left/right flipped", "up/down flipped", "both flipped")
 
     private fun toast(text: String) = main.post {
         android.widget.Toast.makeText(context, text, android.widget.Toast.LENGTH_SHORT).show()
@@ -134,6 +138,7 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
         var yaw = 0f; var pitch = 0f; var pitchZero = 0f; var lastTick = -1
         var lastSent = 0L
         var buttons = 0
+        var muteDownAt = 0L
         fun s16(i: Int) = ((report[i].toInt() and 0xff) or (report[i + 1].toInt() shl 8)).toShort().toFloat()
         fun u24(i: Int) = (report[i].toInt() and 0xff) or ((report[i + 1].toInt() and 0xff) shl 8) or
             ((report[i + 2].toInt() and 0xff) shl 16)
@@ -142,8 +147,15 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
             while (started && attempt == generation) {
                 if (usb.bulkTransfer(input, report, report.size, 200) != 64) continue
                 val now = report[0].toInt() and 0xff
-                val pressed = now and buttons.inv(); buttons = now
-                if (pressed and 8 != 0) { yaw = 0f; pitchZero = pitch; toast("Screen recentered") }   // mute
+                val pressed = now and buttons.inv(); val released = buttons and now.inv(); buttons = now
+                if (pressed and 8 != 0) muteDownAt = SystemClock.uptimeMillis()                       // mute
+                if (released and 8 != 0) {
+                    if (SystemClock.uptimeMillis() - muteDownAt >= 1000) {
+                        lookFlip = (lookFlip + 1) % 4
+                        prefs.edit().putInt("look_flip", lookFlip).apply()
+                        toast("Look direction: ${lookFlipNames[lookFlip]}")
+                    } else { yaw = 0f; pitchZero = pitch; toast("Screen recentered") }
+                }
                 if (pressed and 6 != 0) {                                                             // volume
                     screenSize = (screenSize * if (pressed and 2 != 0) 1.1f else 1f / 1.1f).coerceIn(0.8f, 2.5f)
                     prefs.edit().putFloat("screen_size", screenSize).apply()
@@ -177,7 +189,12 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                     if (kotlin.math.abs(g - 1f) < 0.2f) pitch += (tilt - pitch) * 0.002f
                 }
                 val t = SystemClock.uptimeMillis()
-                if (calibrated && t - lastSent >= 4) { lastSent = t; head(yaw, pitch - pitchZero, screenSize) }
+                if (calibrated && t - lastSent >= 4) {
+                    lastSent = t
+                    val y = if (lookFlip and 1 != 0) -yaw else yaw
+                    val p = (pitch - pitchZero).let { if (lookFlip and 2 != 0) -it else it }
+                    head(y, p, screenSize)
+                }
             }
         } finally {
             usb.releaseInterface(sensor)
