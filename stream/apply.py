@@ -443,4 +443,87 @@ edit("android/app/src/main/AndroidManifest.xml", """        <!-- Enabled in the 
 
         <!-- Enabled in the settings to make Chiaki the home screen""")
 
+# Touchpad clicks (in-game phone camera glitch): over Remote Play a fast press and release can reach the
+# console within one game frame, and the game never sees the press. Every click is replayed in order with
+# a minimum press and release time, so each one lands on a frame.
+input_file = KT + 'session/StreamInput.kt'
+edit(input_file, '''		state.buttons = if(clicked) ControllerState.BUTTON_TOUCHPAD else 0U
+		controllerStateUpdated()
+		return true
+	}''', '''		queueTouchpadClick(clicked)
+		controllerStateUpdated()
+		return true
+	}
+
+	/** Vice City VR: shortest press and release of the touchpad button the console gets, in ms */
+	private val touchpadClickMinMs = 40L
+	private val touchpadClickHandler = android.os.Handler(android.os.Looper.getMainLooper())
+	/** Press (true) / release (false) changes still to send, oldest first */
+	private val touchpadClickQueue = ArrayDeque<Boolean>()
+	private var touchpadClickPhysical = false
+	private var touchpadClickSentAt = 0L
+	private val touchpadClickStep = object: Runnable {
+		override fun run()
+		{
+			val next = touchpadClickQueue.removeFirstOrNull() ?: return
+			touchpadControllerState.buttons = if(next) ControllerState.BUTTON_TOUCHPAD else 0U
+			touchpadClickSentAt = android.os.SystemClock.uptimeMillis()
+			controllerStateUpdated()
+			if(touchpadClickQueue.isNotEmpty())
+				touchpadClickHandler.postDelayed(this, touchpadClickMinMs)
+		}
+	}
+
+	/** Called on the main thread with the physical click state of every touchpad event */
+	private fun queueTouchpadClick(clicked: Boolean)
+	{
+		if(clicked == touchpadClickPhysical)
+			return
+		touchpadClickPhysical = clicked
+		// a long backlog of spam is trimmed to whole clicks, keeping the order press, release
+		while(touchpadClickQueue.size >= 8)
+		{
+			touchpadClickQueue.removeFirst()
+			touchpadClickQueue.removeFirst()
+		}
+		val idle = touchpadClickQueue.isEmpty()
+		touchpadClickQueue.addLast(clicked)
+		if(idle)
+		{
+			val wait = touchpadClickSentAt + touchpadClickMinMs - android.os.SystemClock.uptimeMillis()
+			touchpadClickHandler.removeCallbacks(touchpadClickStep)
+			if(wait > 0) touchpadClickHandler.postDelayed(touchpadClickStep, wait)
+			else touchpadClickStep.run()
+		}
+	}''')
+edit(input_file, '''		val buttons = if(clicked) ControllerState.BUTTON_TOUCHPAD else 0U
+		if(buttons != touchpadControllerState.buttons)
+		{
+			touchpadControllerState.buttons = buttons
+			controllerStateUpdated()
+		}
+		return true''', '''		queueTouchpadClick(clicked)
+		return true''')
+# a new touch must not drop queued clicks; losing focus or the pointer still releases everything
+edit(input_file, '''	fun stopTouchpadTouches()
+	{
+		touchpadTouches.clear()
+		touchpadControllerState.touches.forEach { touchpadControllerState.stopTouch(it.id.toUByte()) }
+		touchpadControllerState.buttons = 0U
+		controllerStateUpdated()''', '''	fun stopTouchpadTouches(keepClick: Boolean = false)
+	{
+		touchpadTouches.clear()
+		touchpadControllerState.touches.forEach { touchpadControllerState.stopTouch(it.id.toUByte()) }
+		if(!keepClick)
+		{
+			touchpadClickHandler.removeCallbacks(touchpadClickStep)
+			touchpadClickQueue.clear()
+			touchpadClickPhysical = false
+			touchpadControllerState.buttons = 0U
+		}
+		controllerStateUpdated()''')
+edit(input_file, '''				if(event.actionMasked == MotionEvent.ACTION_DOWN)
+					stopTouchpadTouches()''', '''				if(event.actionMasked == MotionEvent.ACTION_DOWN)
+					stopTouchpadTouches(keepClick = true)''')
+
 print('apply.py: all edits applied')
