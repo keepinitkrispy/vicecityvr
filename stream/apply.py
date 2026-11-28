@@ -559,7 +559,8 @@ edit(video_renderer, '''    @Volatile var psvrView = PsvrView.FLAT''', '''    @V
     @Volatile var headPitch = 0f
     @Volatile var screenSize = 1.3f
     @Volatile var bodyYaw = 0f
-    @Volatile var bodyPitch = 0f''')
+    @Volatile var bodyPitch = 0f
+    @Volatile var pinnedMap = true''')
 edit(video_renderer, '''                GLES30.glUniform1i(stereo.uniformLoc("u_PsvrView"), view.ordinal)''', '''                GLES30.glUniform1i(stereo.uniformLoc("u_PsvrView"), view.ordinal)
                 GLES30.glUniform2f(stereo.uniformLoc("u_Head"), headYaw, headPitch)
                 GLES30.glUniform1f(stereo.uniformLoc("u_Screen"), screenSize)
@@ -567,7 +568,7 @@ edit(video_renderer, '''                GLES30.glUniform1i(stereo.uniformLoc("u_
                 // GTA VI minimap: the frame's bottom-left (x 0-25%, y 74-100%), shown 30 x 17.5 degrees,
                 // centred 25 degrees left and 28 below straight ahead
                 GLES30.glUniform4f(stereo.uniformLoc("u_MapSrc"), 0f, 0.74f, 0.25f, 0.26f)
-                GLES30.glUniform4f(stereo.uniformLoc("u_MapAt"), 0.698f, -0.336f, 0.524f, 0.305f)''')
+                GLES30.glUniform4f(stereo.uniformLoc("u_MapAt"), 0.698f, -0.336f, if (pinnedMap) 0.524f else 0f, 0.305f)''')
 
 # Recenter the headset view from the controller (L3 + R3 held for a second): headsets without the cable remote
 # have no other button for it.

@@ -124,7 +124,7 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
     // ---- head tracking
     private val prefs = context.getSharedPreferences("psvr_live", Context.MODE_PRIVATE)
     /** Screen width as a multiple of the view's width: above 1 there is picture to look at beyond the edges */
-    @Volatile var screenSize = prefs.getFloat("screen_size", 0.95f)  // the window: nearly all of the view
+    @Volatile var screenSize = prefs.getFloat("screen_size", 0.85f)  // the window: HUD corners within an easy eye glance
         private set
     @Volatile private var recenterRequested = false
     /** Puts the screen straight in front of where the head points now; any thread */
@@ -225,7 +225,7 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                     if (t - prefsReadAt > 500) {                                  // tuning from the Align panel
                         prefsReadAt = t
                         camSpeed = prefs.getFloat("cam_speed", 4.0f); delayMs = prefs.getInt("cam_delay_ms", 80)
-                        screenSize = prefs.getFloat("screen_size", 0.95f)
+                        screenSize = prefs.getFloat("screen_size", 0.85f)
                     }
                     val sx = if (lookFlip and 1 != 0) -1f else 1f
                     val sp = if (lookFlip and 2 != 0) -1f else 1f
