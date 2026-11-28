@@ -696,4 +696,14 @@ edit(KT + 'session/StreamSession.kt', '''	fun stats() = session?.getStats()''', 
 	fun pan(out: FloatArray) = session?.getPan(out) ?: false''')
 edit(KT + 'common/Preferences.kt', '''		val codecDefault = Codec.CODEC_H265''', '''		val codecDefault = Codec.CODEC_H264   // Vice City VR: the head tracking measures camera motion from H.264 vectors''')
 
+# One minimap: while the pinned copy is shown, the original corner of the picture is blacked out.
+edit(video_renderer, '''                if (any(lessThan(uv,vec2(0.0))) || any(greaterThan(uv,vec2(1.0)))) {
+                    outColor = vec4(0.,0.,0.,1.); return;
+                }''', '''                if (any(lessThan(uv,vec2(0.0))) || any(greaterThan(uv,vec2(1.0)))) {
+                    outColor = vec4(0.,0.,0.,1.); return;
+                }
+                if (u_MapAt.z > 0. && all(greaterThanEqual(uv, u_MapSrc.xy)) && all(lessThanEqual(uv, u_MapSrc.xy + u_MapSrc.zw))) {
+                    outColor = vec4(0.,0.,0.,1.); return;
+                }''')
+
 print('apply.py: all edits applied')
