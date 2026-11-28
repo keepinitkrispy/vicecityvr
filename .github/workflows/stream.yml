@@ -9,7 +9,7 @@ on:
 permissions:
   contents: write
 concurrency:
-  group: stream-app
+  group: stream-app-${{ github.ref }}
   cancel-in-progress: true
 env:
   MOMIJI_REPO: https://github.com/yazanj082/momiji.git
@@ -71,7 +71,12 @@ jobs:
           make -j"$(nproc)" && make install
 
       - name: Apply Vice City VR changes
-        run: python3 stream/apply.py momiji
+        run: |
+          python3 stream/apply.py momiji
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            sed -i 's/applicationId "io.github.keepinitkrispy.vicecityvr"/applicationId "io.github.keepinitkrispy.vicecityvr.alignment"/' momiji/android/app/build.gradle
+            sed -i 's/>Vice City VR</>Vice City VR Alignment</' momiji/android/app/src/main/res/values/strings.xml
+          fi
 
       - name: Build APK
         env:
