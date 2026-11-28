@@ -294,7 +294,7 @@ end = source.index('\t\tval upscale', start)
 edit(activity_file, source[start:end], '')
 edit(activity_file, '\tprivate var psvrOutput: PsvrOutput? = null', '''    private var psvrOutput: PsvrOutput? = null
     private var psvrAlignButton: android.widget.Button? = null
-    private val psvrUsb by lazy { PsvrUsb(this, ::refreshPsvrOutput) }
+    private val psvrUsb by lazy { PsvrUsb(this, ::refreshPsvrOutput) { x, y -> viewModel.input.setHeadLook(x, y) } }
 
     private fun refreshPsvrOutput() {
         if (!started || isInPictureInPictureMode) return
@@ -525,5 +525,28 @@ edit(input_file, '''	fun stopTouchpadTouches()
 edit(input_file, '''				if(event.actionMasked == MotionEvent.ACTION_DOWN)
 					stopTouchpadTouches()''', '''				if(event.actionMasked == MotionEvent.ACTION_DOWN)
 					stopTouchpadTouches(keepClick = true)''')
+
+# Head-look: head rotation from the PSVR gyro as right-stick camera input. A state of its own, merged like
+# every input source (the larger stick deflection wins), so the real right stick still works.
+edit(input_file, '''	private val touchpadControllerState = ControllerState() // from the controller's touchpad''', '''	private val touchpadControllerState = ControllerState() // from the controller's touchpad
+	private val headControllerState = ControllerState() // Vice City VR: head-look from the PSVR
+	private val headHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+	/** Vice City VR: right-stick deflection from head rotation, -1..1, stick up negative; any thread */
+	fun setHeadLook(x: Float, y: Float)
+	{
+		val rx = (x.coerceIn(-1f, 1f) * Short.MAX_VALUE).toInt().toShort()
+		val ry = (y.coerceIn(-1f, 1f) * Short.MAX_VALUE).toInt().toShort()
+		headHandler.post {
+			if(headControllerState.rightX == rx && headControllerState.rightY == ry)
+				return@post
+			headControllerState.rightX = rx
+			headControllerState.rightY = ry
+			controllerStateUpdated()
+		}
+	}''')
+edit(input_file, '''		val controllerState = sensorControllerState or keyControllerState or motionControllerState or touchpadControllerState
+''', '''		val controllerState = sensorControllerState or keyControllerState or motionControllerState or touchpadControllerState or headControllerState
+''')
 
 print('apply.py: all edits applied')
