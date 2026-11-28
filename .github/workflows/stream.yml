@@ -79,11 +79,22 @@ jobs:
         env:
           VCVR_FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-android
         run: |
-          # one fixed debug key, so each new build installs over the previous one
-          mkdir -p ~/.android && cp stream/vcvr-debug.keystore ~/.android/debug.keystore
-          echo "sdk.dir=$ANDROID_HOME" > momiji/android/local.properties
+          # One fixed key, so each new build installs over the previous one. Momiji signs debug builds with
+          # the key named in local.properties; a key copied to ~/.android was ignored and every build got a
+          # new random key (three builds, three certificates), so no build could update another.
+          {
+            echo "sdk.dir=$ANDROID_HOME"
+            echo "chiakiKeystore=$GITHUB_WORKSPACE/stream/vcvr-debug.keystore"
+            echo "chiakiKeystorePW=android"
+            echo "chiakiKeyAlias=androiddebugkey"
+            echo "chiakiKeyPW=android"
+          } > momiji/android/local.properties
           cd momiji/android && chmod +x gradlew && ./gradlew --no-daemon assembleFdroidDebug
           ls -la app/build/outputs/apk/fdroid/debug/
+          # refuse to publish an APK that is not signed with the fixed key
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --print-certs app/build/outputs/apk/fdroid/debug/*.apk | tee /tmp/certs.txt
+          grep -qi "SHA-256 digest: 3a076fe02088a64b1cb50c82ef7e1b8046f99fe729e17faeb599e8cc798be25d" /tmp/certs.txt
 
       - name: Publish APK
         env:
