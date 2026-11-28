@@ -562,6 +562,12 @@ edit(input_file, '''		// After sending, so the released buttons of the menu are 
 			aimingLast = aimingNow
 			aimCallback?.invoke(aimingNow)
 		}
+		// Vice City VR: clicking the right stick (not aiming) turns the view to the half behind you and back
+		val r3 = state.buttons and ControllerState.BUTTON_R3 != 0U
+		val l3 = state.buttons and ControllerState.BUTTON_L3 != 0U
+		if(r3 && !r3Last && !l3 && !aimingNow)
+			lookBehindCallback?.invoke()
+		r3Last = r3
 		val recenterHeld = state.buttons and RECENTER_COMBO == RECENTER_COMBO
 		if(recenterHeld && !recenterPending)
 		{
@@ -575,6 +581,10 @@ edit(input_file, '''		// After sending, so the released buttons of the menu are 
 		}
 	}
 
+	/** Vice City VR: right stick clicked while not aiming: look behind / ahead */
+	var lookBehindCallback: (() -> Unit)? = null
+	private var r3Last = false
+
 	/** Vice City VR: called when aiming (L2) starts or ends */
 	var aimCallback: ((Boolean) -> Unit)? = null
 	private var aimingLast = false
@@ -587,7 +597,8 @@ edit(input_file, '''		// After sending, so the released buttons of the menu are 
 	private val recenterCheck = Runnable { if(recenterPending) recenterCallback?.invoke() }''')
 edit(activity_file, '''		viewModel.input.menuComboCallback = { showStreamMenu() }''', '''		viewModel.input.menuComboCallback = { showStreamMenu() }
 		viewModel.input.recenterCallback = { psvrUsb.recenter() }
-		viewModel.input.aimCallback = { psvrUsb.aiming = it }''')
+		viewModel.input.aimCallback = { psvrUsb.aiming = it }
+		viewModel.input.lookBehindCallback = { psvrUsb.lookBehind() }''')
 
 # Head-driven camera turns (looking past the comfort zone): a right-stick state of its own, merged like every
 # input source (the larger deflection wins), so the real right stick still aims.
@@ -611,5 +622,13 @@ edit(input_file, '''	private val touchpadControllerState = ControllerState() // 
 edit(input_file, '''		val controllerState = sensorControllerState or keyControllerState or motionControllerState or touchpadControllerState
 ''', '''		val controllerState = sensorControllerState or keyControllerState or motionControllerState or touchpadControllerState or headControllerState
 ''')
+
+# The right-stick click belongs to the look-behind turn while not aiming, so the game doesn't also act on it.
+edit(input_file, '''		controllerState.also { state -> controllerStateChangedCallback?.invoke(state) }''', '''		controllerState.also { state ->
+			val sent = if(!aimingLast && state.buttons and ControllerState.BUTTON_R3 != 0U)
+				state.copy(buttons = state.buttons and ControllerState.BUTTON_R3.inv())
+			else state
+			controllerStateChangedCallback?.invoke(sent)
+		}''')
 
 print('apply.py: all edits applied')

@@ -22,6 +22,8 @@ import androidx.core.content.ContextCompat
  * in front of you; while the game catches up (Remote Play delay) it is shifted with the head ([head]: yaw and
  * pitch offset in radians, left/up positive, and the screen size), so the world doesn't drag behind your turns.
  * While aiming (L2, [aiming]) the head lets go and the right stick has the crosshair.
+ * The head covers the half of the sphere in front of you; clicking the right stick ([lookBehind]) turns the
+ * camera 180 degrees so the same head movements look around the half behind you, and clicking again turns back.
  * Recenter (level the view): hold L3 + R3 for a second ([recenter]). Tuning, in the phone's Align panel:
  * camera speed (rad/s the game turns at full stick) and delay (ms until a turn shows in the stream).
  */
@@ -126,6 +128,9 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
     @Volatile private var recenterRequested = false
     /** Puts the screen straight in front of where the head points now; any thread */
     fun recenter() { recenterRequested = true }
+    @Volatile private var lookBehindRequested = false
+    /** Turns the view to the half of the sphere behind you, or back; any thread */
+    fun lookBehind() { lookBehindRequested = true }
     /** L2 held: the right stick aims and the head doesn't move the camera; any thread */
     @Volatile var aiming = false
     /** bit 0: left/right flipped, bit 1: up/down flipped */
@@ -150,6 +155,7 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
         var muteDownAt = 0L
         // camera model: where the game camera points (same frame as the head), and its recent history
         var camYaw = 0f; var camPitch = 0f; var lastHy = 0f; var lastHp = 0f; var wasAiming = true
+        var behind = 0f   // 0 or pi: which half of the sphere the head looks around
         val histYaw = FloatArray(128); val histPitch = FloatArray(128); var histPos = 0
         var camSpeed = prefs.getFloat("cam_speed", 4.0f); var delayMs = prefs.getInt("cam_delay_ms", 80)
         var prefsReadAt = 0L
@@ -216,7 +222,12 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                     }
                     val sx = if (lookFlip and 1 != 0) -1f else 1f
                     val sp = if (lookFlip and 2 != 0) -1f else 1f
-                    val hy = sx * yaw; val hp = sp * (pitch - pitchZero)
+                    if (lookBehindRequested) {
+                        lookBehindRequested = false
+                        behind = if (behind == 0f) kotlin.math.PI.toFloat() else 0f
+                        toast(if (behind == 0f) "Looking ahead" else "Looking behind")
+                    }
+                    val hy = sx * yaw + behind; val hp = sp * (pitch - pitchZero)
                     if (aiming) {                                                 // the stick has the crosshair
                         wasAiming = true
                         stick(0f, 0f); head(0f, 0f, screenSize)
@@ -240,7 +251,9 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                     histYaw[histPos] = camYaw; histPitch[histPos] = camPitch
                     val back = (delayMs / 4).coerceIn(0, histYaw.size - 1)
                     val then = (histPos - back + histYaw.size) % histYaw.size
-                    head((hy - histYaw[then]).coerceIn(-0.4f, 0.4f), (hp - histPitch[then]).coerceIn(-0.4f, 0.4f), screenSize)
+                    // a big catch-up (the 180-degree turn) is shown as the stream has it, not shifted
+                    val dy = hy - histYaw[then]; val dp = hp - histPitch[then]
+                    head(if (kotlin.math.abs(dy) > 0.4f) 0f else dy, if (kotlin.math.abs(dp) > 0.4f) 0f else dp, screenSize)
                 }
             }
         } finally {
