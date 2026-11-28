@@ -172,8 +172,7 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                         continue
                     }
                     if (still) { bias[0] += (gx - bias[0]) * 0.0005f; bias[1] += (gy - bias[1]) * 0.0005f }
-                    yaw += (gy - bias[1]) * dt
-                    yaw -= yaw * dt / 30f                                       // the screen drifts back in front of you
+                    yaw += (gy - bias[1]) * dt                                  // the screen stays put; mute recenters
                     pitch += (gx - bias[0]) * dt
                     if (kotlin.math.abs(g - 1f) < 0.2f) pitch += (tilt - pitch) * 0.002f
                 }
