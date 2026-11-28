@@ -94,6 +94,11 @@ class PsvrOutput(private val activity: Activity, display: Display, width: Int, h
         renderer.release()
         dismiss()
     }
+    /** Head tracking, from any thread: the screen stays fixed in space while the head turns */
+    fun setHead(yaw: Float, pitch: Float, size: Float) {
+        renderer.headYaw = yaw; renderer.headPitch = pitch; renderer.screenSize = size
+        if (!released) glView.requestRender()
+    }
     private fun apply(c: PsvrCalibration) {
         calibration=c; renderer.psvrCalibration=c; glView.requestRender()
     }

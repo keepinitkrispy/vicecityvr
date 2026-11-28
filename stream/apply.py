@@ -294,7 +294,7 @@ end = source.index('\t\tval upscale', start)
 edit(activity_file, source[start:end], '')
 edit(activity_file, '\tprivate var psvrOutput: PsvrOutput? = null', '''    private var psvrOutput: PsvrOutput? = null
     private var psvrAlignButton: android.widget.Button? = null
-    private val psvrUsb by lazy { PsvrUsb(this, ::refreshPsvrOutput) { x, y -> viewModel.input.setHeadLook(x, y) } }
+    private val psvrUsb by lazy { PsvrUsb(this, ::refreshPsvrOutput) { yaw, pitch, size -> psvrOutput?.setHead(yaw, pitch, size) } }
 
     private fun refreshPsvrOutput() {
         if (!started || isInPictureInPictureMode) return
@@ -526,27 +526,23 @@ edit(input_file, '''				if(event.actionMasked == MotionEvent.ACTION_DOWN)
 					stopTouchpadTouches()''', '''				if(event.actionMasked == MotionEvent.ACTION_DOWN)
 					stopTouchpadTouches(keepClick = true)''')
 
-# Head-look: head rotation from the PSVR gyro as right-stick camera input. A state of its own, merged like
-# every input source (the larger stick deflection wins), so the real right stick still works.
-edit(input_file, '''	private val touchpadControllerState = ControllerState() // from the controller's touchpad''', '''	private val touchpadControllerState = ControllerState() // from the controller's touchpad
-	private val headControllerState = ControllerState() // Vice City VR: head-look from the PSVR
-	private val headHandler = android.os.Handler(android.os.Looper.getMainLooper())
-
-	/** Vice City VR: right-stick deflection from head rotation, -1..1, stick up negative; any thread */
-	fun setHeadLook(x: Float, y: Float)
-	{
-		val rx = (x.coerceIn(-1f, 1f) * Short.MAX_VALUE).toInt().toShort()
-		val ry = (y.coerceIn(-1f, 1f) * Short.MAX_VALUE).toInt().toShort()
-		headHandler.post {
-			if(headControllerState.rightX == rx && headControllerState.rightY == ry)
-				return@post
-			headControllerState.rightX = rx
-			headControllerState.rightY = ry
-			controllerStateUpdated()
-		}
-	}''')
-edit(input_file, '''		val controllerState = sensorControllerState or keyControllerState or motionControllerState or touchpadControllerState
-''', '''		val controllerState = sensorControllerState or keyControllerState or motionControllerState or touchpadControllerState or headControllerState
-''')
+# Head tracking: the game picture is a screen fixed in space, wider than the view, and turning your head looks
+# across it. Done in the headset renderer from the PSVR gyro, so it reacts at once; the game camera (aiming)
+# is untouched.
+edit(video_renderer, '''            uniform int u_PsvrView;''', '''            uniform int u_PsvrView;
+            uniform vec2 u_Head;
+            uniform float u_Screen;''')
+edit(video_renderer, '''                vec2 uv = p/u_Picture + .5;''', '''                // view angle of this pixel (480 px focal length: the 960-px picture spans 90 degrees at size 1),
+                // minus the head's yaw/pitch (left/up positive; p.y grows downward), over the screen's angular size
+                vec2 ang = atan(p / 480.0) - u_Head;
+                vec2 uv = ang / (2.0 * atan(u_Picture / 960.0) * u_Screen) + .5;''')
+edit(video_renderer, '''    @Volatile var psvrView = PsvrView.FLAT''', '''    @Volatile var psvrView = PsvrView.FLAT
+    /** Head yaw and pitch (radians, left/up positive) and screen size, from the PSVR's head tracking */
+    @Volatile var headYaw = 0f
+    @Volatile var headPitch = 0f
+    @Volatile var screenSize = 1.3f''')
+edit(video_renderer, '''                GLES30.glUniform1i(stereo.uniformLoc("u_PsvrView"), view.ordinal)''', '''                GLES30.glUniform1i(stereo.uniformLoc("u_PsvrView"), view.ordinal)
+                GLES30.glUniform2f(stereo.uniformLoc("u_Head"), headYaw, headPitch)
+                GLES30.glUniform1f(stereo.uniformLoc("u_Screen"), screenSize)''')
 
 print('apply.py: all edits applied')

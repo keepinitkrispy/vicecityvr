@@ -16,13 +16,14 @@ import android.os.SystemClock
 import androidx.core.content.ContextCompat
 
 /**
- * A streaming activity's USB link to the original PSVR processor unit: the VR-mode handshake, then
- * head-look. Head rotation speed from the headset's gyro becomes right-stick camera input ([headLook],
- * x and y in -1..1, stick up negative), so turning your head turns the first-person camera.
- * Headset cable remote: mute = head-look on/off, volume up/down = head-look speed.
+ * A streaming activity's USB link to the original PSVR processor unit: the VR-mode handshake, then head
+ * tracking. [head] gets the head's yaw and pitch (radians, left and up positive, 0 = straight at the
+ * screen) and the screen size, so the game picture stays fixed in space and turning your head looks
+ * across it. The game's camera is never touched: aiming stays on the stick.
+ * Headset cable remote: mute = recenter the screen, volume up/down = screen size.
  */
 internal class PsvrUsb(private val context: Context, private val changed: () -> Unit,
-                       private val headLook: (Float, Float) -> Unit = { _, _ -> }) {
+                       private val head: (Float, Float, Float) -> Unit = { _, _, _ -> }) {
     private val manager = context.getSystemService(UsbManager::class.java)
     companion object {
         fun permissionAction(context: Context) = context.packageName + ".PSVR_USB_PERMISSION"
@@ -106,28 +107,20 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                 }
                 if (confirmed && usb != null) runCatching { headLoop(usb, target, attempt) }
             } finally {
-                headLook(0f, 0f)
+                head(0f, 0f, screenSize)
                 usb?.close()
             }
         }, "psvr-usb").start()
     }
 
-    // ---- head-look
+    // ---- head tracking
     private val prefs = context.getSharedPreferences("psvr_live", Context.MODE_PRIVATE)
-    @Volatile private var headEnabled = prefs.getBoolean("head_look", true)
-    @Volatile private var headSpeed = prefs.getFloat("head_speed", 1f)
+    /** Screen width as a multiple of the view's width: above 1 there is picture to look at beyond the edges */
+    @Volatile var screenSize = prefs.getFloat("screen_size", 1.3f)
+        private set
 
     private fun toast(text: String) = main.post {
         android.widget.Toast.makeText(context, text, android.widget.Toast.LENGTH_SHORT).show()
-    }
-
-    /** Stick deflection for a head rotation rate (rad/s): small rates are noise, then it starts at the
-     *  game's own stick dead zone so slow head turns still move the camera. */
-    private fun stick(rate: Float): Float {
-        val a = kotlin.math.abs(rate)
-        if (a < 0.06f) return 0f
-        val t = ((a - 0.06f) * headSpeed / 2.5f).coerceAtMost(1f)
-        return kotlin.math.sign(rate) * (0.2f + 0.8f * t)
     }
 
     /** Reads the headset's sensor interface until this link is replaced or stopped. */
@@ -138,52 +131,54 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
             .firstOrNull { it.direction == UsbConstants.USB_DIR_IN } ?: return
         val report = ByteArray(64)
         val bias = FloatArray(3); var biasSamples = 0; var calibrated = false
-        var yawSum = 0f; var pitchSum = 0f; var samples = 0
-        var lastSent = SystemClock.uptimeMillis()
+        var yaw = 0f; var pitch = 0f; var pitchZero = 0f; var lastTick = -1
+        var lastSent = 0L
         var buttons = 0
         fun s16(i: Int) = ((report[i].toInt() and 0xff) or (report[i + 1].toInt() shl 8)).toShort().toFloat()
+        fun u24(i: Int) = (report[i].toInt() and 0xff) or ((report[i + 1].toInt() and 0xff) shl 8) or
+            ((report[i + 2].toInt() and 0xff) shl 16)
+        head(0f, 0f, screenSize)
         try {
             while (started && attempt == generation) {
                 if (usb.bulkTransfer(input, report, report.size, 200) != 64) continue
                 val now = report[0].toInt() and 0xff
                 val pressed = now and buttons.inv(); buttons = now
-                if (pressed and 8 != 0) {                                   // mute: on/off
-                    headEnabled = !headEnabled
-                    prefs.edit().putBoolean("head_look", headEnabled).apply()
-                    toast(if (headEnabled) "Head-look on" else "Head-look off")
-                    if (!headEnabled) headLook(0f, 0f)
-                }
-                if (pressed and 6 != 0) {                                   // volume: speed
-                    headSpeed = (headSpeed * if (pressed and 2 != 0) 1.25f else 0.8f).coerceIn(0.25f, 4f)
-                    prefs.edit().putFloat("head_speed", headSpeed).apply()
-                    toast("Head-look speed ${"%.2f".format(java.util.Locale.US, headSpeed)}")
+                if (pressed and 8 != 0) { yaw = 0f; pitchZero = pitch; toast("Screen recentered") }   // mute
+                if (pressed and 6 != 0) {                                                             // volume
+                    screenSize = (screenSize * if (pressed and 2 != 0) 1.1f else 1f / 1.1f).coerceIn(0.8f, 2.5f)
+                    prefs.edit().putFloat("screen_size", screenSize).apply()
+                    toast("Screen size ${"%.2f".format(java.util.Locale.US, screenSize)}")
                 }
                 for (off in intArrayOf(16, 32)) {
                     // raw order (y, x, z); x right, y up, z back (Monado/OpenHMD); 0.00105 rad/s, 1/16384 g per LSB
                     val gx = s16(off + 6) * 0.00105f; val gy = s16(off + 4) * 0.00105f; val gz = -s16(off + 8) * 0.00105f
                     val ax = s16(off + 12) / 16384f; val ay = s16(off + 10) / 16384f; val az = -s16(off + 14) / 16384f
+                    val tick = u24(off)
+                    var dt = if (lastTick < 0) 0f else (((tick - lastTick) and 0xffffff) * 1e-6f)
+                    lastTick = tick
+                    if (dt <= 0f || dt > 0.005f) dt = 0.0005f                   // packet loss or rollover
                     val spin = kotlin.math.sqrt(gx * gx + gy * gy + gz * gz)
                     val g = kotlin.math.sqrt(ax * ax + ay * ay + az * az)
                     val still = spin < 0.05f && kotlin.math.abs(g - 1f) < 0.05f
-                    if (!calibrated) {                                      // learn the gyro's resting offset
+                    // looking up tilts gravity toward -z: pitch from the accelerometer
+                    val tilt = kotlin.math.atan2(-az, ay)
+                    if (!calibrated) {                                          // learn the gyro's resting offset
+                        pitch = tilt; pitchZero = tilt
                         if (still) {
                             biasSamples++
                             bias[0] += (gx - bias[0]) / biasSamples; bias[1] += (gy - bias[1]) / biasSamples
-                            bias[2] += (gz - bias[2]) / biasSamples
-                            if (biasSamples >= 1000) { calibrated = true; toast("Head-look ready") }
+                            if (biasSamples >= 1000) calibrated = true
                         } else biasSamples = 0
                         continue
                     }
                     if (still) { bias[0] += (gx - bias[0]) * 0.0005f; bias[1] += (gy - bias[1]) * 0.0005f }
-                    pitchSum += gx - bias[0]; yawSum += gy - bias[1]; samples++
+                    yaw += (gy - bias[1]) * dt
+                    yaw -= yaw * dt / 30f                                       // the screen drifts back in front of you
+                    pitch += (gx - bias[0]) * dt
+                    if (kotlin.math.abs(g - 1f) < 0.2f) pitch += (tilt - pitch) * 0.002f
                 }
                 val t = SystemClock.uptimeMillis()
-                if (t - lastSent >= 8 && samples > 0) {
-                    lastSent = t
-                    // looking left = positive yaw = stick left (negative); looking up = positive pitch = stick up (negative)
-                    if (headEnabled) headLook(-stick(yawSum / samples), -stick(pitchSum / samples))
-                    yawSum = 0f; pitchSum = 0f; samples = 0
-                }
+                if (calibrated && t - lastSent >= 4) { lastSent = t; head(yaw, pitch - pitchZero, screenSize) }
             }
         } finally {
             usb.releaseInterface(sensor)
