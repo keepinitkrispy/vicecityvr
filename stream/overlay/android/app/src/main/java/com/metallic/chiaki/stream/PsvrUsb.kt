@@ -17,15 +17,18 @@ import androidx.core.content.ContextCompat
 
 /**
  * A streaming activity's USB link to the original PSVR processor unit: the VR-mode handshake, then head
- * tracking. [head] gets the head's yaw and pitch (radians, left and up positive, 0 = straight at the
- * screen) and the screen size, so the game picture stays fixed in space and turning your head looks
- * across it. The game's camera is never touched: aiming stays on the stick.
+ * tracking, "both by distance": within about 20 degrees sideways / 15 up-down the head looks around a screen
+ * fixed in space ([head]: yaw and pitch from the screen center, radians, left and up positive, and the screen
+ * size), with no stream delay. Looking further turns the game camera toward the gaze ([stick]: right-stick
+ * deflection, -1..1, up negative) while the screen eases back in front, until the reticle (the picture's
+ * center) is under the gaze. The real right stick still aims on top.
  * Recenter: hold L3 + R3 on the controller for a second ([recenter]), or tap mute on a headset cable remote.
  * Cable remote, where there is one: hold mute 1 s = next look direction setting (normal, left/right flipped,
  * up/down flipped, both), volume up/down = screen size.
  */
 internal class PsvrUsb(private val context: Context, private val changed: () -> Unit,
-                       private val head: (Float, Float, Float) -> Unit = { _, _, _ -> }) {
+                       private val head: (Float, Float, Float) -> Unit = { _, _, _ -> },
+                       private val stick: (Float, Float) -> Unit = { _, _ -> }) {
     private val manager = context.getSystemService(UsbManager::class.java)
     companion object {
         fun permissionAction(context: Context) = context.packageName + ".PSVR_USB_PERMISSION"
@@ -110,6 +113,7 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                 if (confirmed && usb != null) runCatching { headLoop(usb, target, attempt) }
             } finally {
                 head(0f, 0f, screenSize)
+                stick(0f, 0f)
                 usb?.close()
             }
         }, "psvr-usb").start()
@@ -143,6 +147,9 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
         var lastSent = 0L
         var buttons = 0
         var muteDownAt = 0L
+        var turnX = false; var turnY = false
+        val cam = 2.0f   // rad/s the game camera is assumed to turn at full stick
+        fun shape(v: Float) = if (v == 0f) 0f else kotlin.math.sign(v) * (0.2f + 0.8f * kotlin.math.abs(v).coerceAtMost(1f))
         fun s16(i: Int) = ((report[i].toInt() and 0xff) or (report[i + 1].toInt() shl 8)).toShort().toFloat()
         fun u24(i: Int) = (report[i].toInt() and 0xff) or ((report[i + 1].toInt() and 0xff) shl 8) or
             ((report[i + 2].toInt() and 0xff) shl 16)
@@ -195,9 +202,22 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                 }
                 val t = SystemClock.uptimeMillis()
                 if (calibrated && t - lastSent >= 4) {
+                    val dtc = (t - lastSent).coerceAtMost(50L) / 1000f
                     lastSent = t
-                    val y = if (lookFlip and 1 != 0) -yaw else yaw
-                    val p = (pitch - pitchZero).let { if (lookFlip and 2 != 0) -it else it }
+                    val sx = if (lookFlip and 1 != 0) -1f else 1f
+                    val sp = if (lookFlip and 2 != 0) -1f else 1f
+                    var y = sx * yaw; var p = sp * (pitch - pitchZero)
+                    // past the comfort zone the camera turns toward the gaze and the screen follows,
+                    // until the reticle is under the gaze again (then small looks are free again)
+                    if (!turnX && kotlin.math.abs(y) > 0.35f) turnX = true
+                    else if (turnX && kotlin.math.abs(y) < 0.035f) turnX = false
+                    if (!turnY && kotlin.math.abs(p) > 0.26f) turnY = true
+                    else if (turnY && kotlin.math.abs(p) < 0.035f) turnY = false
+                    val rx = if (turnX) (y * 3f).coerceIn(-cam, cam) else 0f
+                    val ry = if (turnY) (p * 3f).coerceIn(-cam, cam) else 0f
+                    yaw -= sx * rx * dtc; pitchZero += sp * ry * dtc
+                    y -= rx * dtc; p -= ry * dtc
+                    stick(shape(-rx / cam), shape(-ry / cam))
                     head(y, p, screenSize)
                 }
             }

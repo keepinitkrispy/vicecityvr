@@ -294,7 +294,9 @@ end = source.index('\t\tval upscale', start)
 edit(activity_file, source[start:end], '')
 edit(activity_file, '\tprivate var psvrOutput: PsvrOutput? = null', '''    private var psvrOutput: PsvrOutput? = null
     private var psvrAlignButton: android.widget.Button? = null
-    private val psvrUsb by lazy { PsvrUsb(this, ::refreshPsvrOutput) { yaw, pitch, size -> psvrOutput?.setHead(yaw, pitch, size) } }
+    private val psvrUsb by lazy { PsvrUsb(this, ::refreshPsvrOutput,
+        head = { yaw, pitch, size -> psvrOutput?.setHead(yaw, pitch, size) },
+        stick = { x, y -> viewModel.input.setHeadLook(x, y) }) }
 
     private fun refreshPsvrOutput() {
         if (!started || isInPictureInPictureMode) return
@@ -574,5 +576,28 @@ edit(input_file, '''		// After sending, so the released buttons of the menu are 
 	private val recenterCheck = Runnable { if(recenterPending) recenterCallback?.invoke() }''')
 edit(activity_file, '''		viewModel.input.menuComboCallback = { showStreamMenu() }''', '''		viewModel.input.menuComboCallback = { showStreamMenu() }
 		viewModel.input.recenterCallback = { psvrUsb.recenter() }''')
+
+# Head-driven camera turns (looking past the comfort zone): a right-stick state of its own, merged like every
+# input source (the larger deflection wins), so the real right stick still aims.
+edit(input_file, '''	private val touchpadControllerState = ControllerState() // from the controller's touchpad''', '''	private val touchpadControllerState = ControllerState() // from the controller's touchpad
+	private val headControllerState = ControllerState() // Vice City VR: camera turns from looking far
+	private val headHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+	/** Vice City VR: right-stick deflection from the head, -1..1, stick up negative; any thread */
+	fun setHeadLook(x: Float, y: Float)
+	{
+		val rx = (x.coerceIn(-1f, 1f) * Short.MAX_VALUE).toInt().toShort()
+		val ry = (y.coerceIn(-1f, 1f) * Short.MAX_VALUE).toInt().toShort()
+		headHandler.post {
+			if(headControllerState.rightX == rx && headControllerState.rightY == ry)
+				return@post
+			headControllerState.rightX = rx
+			headControllerState.rightY = ry
+			controllerStateUpdated()
+		}
+	}''')
+edit(input_file, '''		val controllerState = sensorControllerState or keyControllerState or motionControllerState or touchpadControllerState
+''', '''		val controllerState = sensorControllerState or keyControllerState or motionControllerState or touchpadControllerState or headControllerState
+''')
 
 print('apply.py: all edits applied')
