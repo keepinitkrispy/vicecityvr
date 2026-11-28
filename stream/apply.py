@@ -248,4 +248,100 @@ edit(KT+'stream/VideoRenderer.kt', '    fun release() {\n        surface?.releas
         }
         surface?.release()''')
 
+# Calibration uses the game renderer's viewport, eye transforms, and lens warp.
+video_renderer = KT + 'stream/VideoRenderer.kt'
+edit(video_renderer, '    private var psvrProgram: Program? = null', '''    private var psvrProgram: Program? = null
+    @Volatile var psvrView = PsvrView.FLAT''')
+edit(video_renderer, '            uniform vec2 u_Picture;', '''            uniform vec2 u_Picture;
+            uniform int u_PsvrView;''')
+edit(video_renderer, '                vec2 uv = p/u_Picture + .5;', '''                if (u_PsvrView >= 2) {
+                    bool left = (v_TexCoord.x < .5) != (u_Swap > .5);
+                    vec2 a = abs(p);
+                    float crosshair = float((a.x < 2. && a.y < 54.) || (a.y < 2. && a.x < 54.));
+                    vec2 grid = abs(mod(p + 40., 80.) - 40.);
+                    float line = float(min(grid.x, grid.y) < 1.);
+                    float ring = float(abs(length(p) - 110.) < 2.);
+                    float box = float(abs(max(a.x, a.y) - 200.) < 2.);
+                    float fine = float(a.x < 70. && a.y > 140. && a.y < 160.
+                                       && mod(floor(p.x / 4.), 2.) == 0.);
+                    float mark = max(max(crosshair, ring), max(box, fine));
+                    vec3 tint = u_PsvrView == 3
+                        ? (left ? vec3(1., .15, .15) : vec3(.15, .55, 1.))
+                        : vec3(1.);
+                    outColor = vec4(max(vec3(.04 + .13 * line), tint * mark), 1.);
+                    return;
+                }
+                vec2 uv = p/u_Picture + .5;''')
+edit(video_renderer, '                src.x+=offset;', '                if (u_PsvrView == 1) src.x += offset;')
+edit(video_renderer, '            updateResponse(pending>0)\n            updateNeural(pending>0)', '''            val view = psvrView
+            if (view == PsvrView.STEREO) {
+                updateResponse(pending > 0)
+                updateNeural(pending > 0)
+            } else {
+                haveSmall = false
+                haveResponse = false
+                neuralStamp = 0L
+            }''')
+edit(video_renderer, '                GLES30.glUniform1f(stereo.uniformLoc("u_Ready"),if(haveResponse)1f else 0f)', '''                GLES30.glUniform1i(stereo.uniformLoc("u_PsvrView"), view.ordinal)
+                GLES30.glUniform1f(stereo.uniformLoc("u_Ready"),if(haveResponse)1f else 0f)''')
+
+# Keep the phone output alive so USB or HDMI hotplug can change the decoder destination.
+activity_file = KT + 'stream/StreamActivity.kt'
+p = os.path.join(M, activity_file)
+source = open(p, encoding='utf-8').read()
+start = source.index('\t\tval psvrDisplay = PsvrOutput.find(this)')
+end = source.index('\t\tval upscale', start)
+edit(activity_file, source[start:end], '')
+edit(activity_file, '\tprivate var psvrOutput: PsvrOutput? = null', '''    private var psvrOutput: PsvrOutput? = null
+    private var psvrAlignButton: android.widget.Button? = null
+    private val psvrUsb by lazy { PsvrUsb(this, ::refreshPsvrOutput) }
+
+    private fun refreshPsvrOutput() {
+        if (!started || isInPictureInPictureMode) return
+        val display = if (psvrUsb.ready) PsvrOutput.find(this) else null
+        val current = psvrOutput
+        if (current != null && current.isShowing && current.display.displayId == display?.displayId) return
+        if (current != null) {
+            psvrOutput = null
+            viewModel.session.detachSurface()
+            current.releaseOutput()
+            psvrAlignButton?.let { binding.root.removeView(it) }
+            psvrAlignButton = null
+            val phone = videoRenderer?.outputSurface ?: binding.surfaceView.holder.surface
+            if (phone.isValid) viewModel.session.attachToSurface(phone)
+        }
+        if (display == null) return
+        val profile = viewModel.session.connectInfo.videoProfile
+        lateinit var output: PsvrOutput
+        output = PsvrOutput(this, display, profile.width, profile.height) { surface ->
+            runOnUiThread {
+                if (psvrOutput === output && surface.isValid) viewModel.session.attachToSurface(surface)
+            }
+        }
+        try {
+            psvrOutput = output
+            output.show()
+            secondScreen?.dismiss()
+            secondScreen = null
+            val align = android.widget.Button(this).apply {
+                text = "Align / Save"
+                setOnClickListener { output.showAlignment() }
+            }
+            psvrAlignButton = align
+            binding.root.addView(align, android.widget.FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
+        } catch (e: WindowManager.InvalidDisplayException) {
+            psvrOutput = null
+            output.releaseOutput()
+            Log.w(TAG, "PSVR display unavailable", e)
+        }
+    }''')
+edit(activity_file, 'private fun updateSecondScreen()\n\t{', '''private fun updateSecondScreen()
+    {
+        psvrUsb.refresh()
+        refreshPsvrOutput()''')
+edit(activity_file, '\t\tstarted = true\n\t\tupdateSecondScreen()', '\t\tstarted = true\n\t\tpsvrUsb.start()\n\t\tupdateSecondScreen()')
+edit(activity_file, '\t\tviewModel.session.pause()\n\t\tif (psvrOutput != null)', '\t\tpsvrUsb.stop()\n\t\tviewModel.session.pause()\n\t\tif (psvrOutput != null)')
+edit(video_renderer, '    private var surface: Surface? = null', '''    @Volatile private var surface: Surface? = null
+    val outputSurface: Surface? get() = surface''')
+
 print('apply.py: all edits applied')
