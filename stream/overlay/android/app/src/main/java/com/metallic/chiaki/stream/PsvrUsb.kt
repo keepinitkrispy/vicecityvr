@@ -18,7 +18,10 @@ import androidx.core.content.ContextCompat
 /** A streaming activity's USB handshake with the original PSVR processor unit. */
 internal class PsvrUsb(private val context: Context, private val changed: () -> Unit) {
     private val manager = context.getSystemService(UsbManager::class.java)
-    private val permission = context.packageName + ".PSVR_USB_PERMISSION"
+    companion object {
+        fun permissionAction(context: Context) = context.packageName + ".PSVR_USB_PERMISSION"
+    }
+    private val permission = permissionAction(context)
     private val main = Handler(Looper.getMainLooper())
     private var started = false
     private var device: UsbDevice? = null
@@ -33,9 +36,12 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                 refresh()
                 return
             }
+            // from the permission prompt, or from PsvrAttachActivity (which can arrive before the attach broadcast)
             val granted = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
-            if (started && granted != null && granted == device && manager?.hasPermission(granted) == true)
-                initialize(granted)
+            if (!started || granted == null || manager?.hasPermission(granted) != true) return
+            if (granted.vendorId != 0x054c || granted.productId != 0x09af) return
+            device = granted
+            initialize(granted)
         }
     }
 

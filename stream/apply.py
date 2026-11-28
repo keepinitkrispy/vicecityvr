@@ -425,4 +425,22 @@ edit(session_file, '''	fun attachToSurface(surface: Surface)
 		headsetSurface = null
 	}''')
 
+# PSVR processor unit as this app's USB device, handled by an invisible activity: Android then offers
+# "always" on the permission prompt and keeps the grant across replugs and reboots, and a running stream
+# is never interrupted by an activity coming to the front.
+edit("android/app/src/main/AndroidManifest.xml", """        <!-- Enabled in the settings to make Chiaki the home screen""", """        <activity android:name=".stream.PsvrAttachActivity"
+            android:theme="@android:style/Theme.NoDisplay"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity="">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/psvr_device_filter" />
+        </activity>
+
+        <!-- Enabled in the settings to make Chiaki the home screen""")
+
 print('apply.py: all edits applied')
