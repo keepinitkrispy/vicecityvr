@@ -19,6 +19,9 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import org.json.JSONObject
 
+// Ordinals are the view IDs consumed by the PSVR fragment shader.
+enum class PsvrView { FLAT, STEREO, FUSION, EYE_ID }
+
 data class PsvrEye(val x: Float = 0f, val y: Float = 0f, val scale: Float = 1f)
 data class PsvrCalibration(val left: PsvrEye = PsvrEye(), val right: PsvrEye = PsvrEye(),
                            val swap: Boolean = false, val warp: Boolean = false,
@@ -74,6 +77,7 @@ class PsvrOutput(private val activity: Activity, display: Display, width: Int, h
         glView.setEGLConfigChooser(8,8,8,0,0,0)
         glView.preserveEGLContextOnPause = true
         renderer.psvrCalibration = calibration
+        renderer.psvrView = if (prefs.getBoolean("stereo_confirmed", false)) PsvrView.STEREO else PsvrView.FLAT
         glView.setRenderer(renderer)
         glView.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
         setContentView(glView)
@@ -93,9 +97,17 @@ class PsvrOutput(private val activity: Activity, display: Display, width: Int, h
     private fun apply(c: PsvrCalibration) {
         calibration=c; renderer.psvrCalibration=c; glView.requestRender()
     }
-    private fun save() { prefs.edit().putString("calibration",calibration.json()).apply() }
+    private fun showView(view: PsvrView) {
+        renderer.psvrView = view
+        glView.requestRender()
+    }
+    private fun save(stereo: Boolean) {
+        prefs.edit().putString("calibration", calibration.json()).putBoolean("stereo_confirmed", stereo).apply()
+        showView(if (stereo) PsvrView.STEREO else PsvrView.FLAT)
+    }
     fun showAlignment() {
         if (released) return
+        showView(PsvrView.FUSION)
         var eye=0; var step=2f
         val layout=LinearLayout(activity).apply { orientation=LinearLayout.VERTICAL; setPadding(12,8,12,8) }
         val status=TextView(activity).apply { setTextColor(Color.WHITE); gravity=Gravity.CENTER }
@@ -114,6 +126,9 @@ class PsvrOutput(private val activity: Activity, display: Display, width: Int, h
                 r.addView(b,LinearLayout.LayoutParams(0,-2,1f))
             }
         }
+        row("Fusion grid" to { showView(PsvrView.FUSION) },
+            "Eye ID" to { showView(PsvrView.EYE_ID) },
+            "Flat game" to { showView(PsvrView.FLAT) })
         row("Left eye" to {eye=0;refresh()}, "Right eye" to {eye=1;refresh()}, "Fine/coarse" to {step=if(step==2f)10f else 2f;refresh()})
         row("Left" to {change(dx=-step)}, "Up" to {change(dy=-step)}, "Right" to {change(dx=step)})
         row("Smaller" to {change(mult=if(step==2f).996f else .98f)}, "Down" to {change(dy=step)}, "Larger" to {change(mult=if(step==2f)1.004f else 1.02f)})
@@ -125,6 +140,9 @@ class PsvrOutput(private val activity: Activity, display: Display, width: Int, h
         })
         refresh()
         AlertDialog.Builder(activity).setTitle("Live PSVR alignment").setView(layout)
-            .setPositiveButton("Save and return") { _,_ -> save() }.setOnCancelListener { save() }.show()
+            .setPositiveButton("Save / flat") { _,_ -> save(false) }
+            .setNeutralButton("Save / stereo") { _,_ -> save(true) }
+            .setOnCancelListener { save(false) }
+            .show()
     }
 }

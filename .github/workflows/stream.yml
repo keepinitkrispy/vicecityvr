@@ -3,13 +3,13 @@
 name: stream-app
 on:
   push:
-    branches: [main]
+    branches: [main, 'codex/psvr-*', 'ccr-*']
     paths: ['stream/**', '.github/workflows/stream.yml']
   workflow_dispatch:
 permissions:
   contents: write
 concurrency:
-  group: stream-app
+  group: stream-app-${{ github.ref }}
   cancel-in-progress: true
 env:
   MOMIJI_REPO: https://github.com/yazanj082/momiji.git
@@ -71,28 +71,43 @@ jobs:
           make -j"$(nproc)" && make install
 
       - name: Apply Vice City VR changes
+        # Same app id on every branch: the alignment app only shares calibration with this id,
+        # and the shared debug key lets a test build install over the release one (and back).
         run: python3 stream/apply.py momiji
 
       - name: Build APK
         env:
           VCVR_FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-android
         run: |
-          # one fixed debug key, so each new build installs over the previous one
-          mkdir -p ~/.android && cp stream/vcvr-debug.keystore ~/.android/debug.keystore
-          echo "sdk.dir=$ANDROID_HOME" > momiji/android/local.properties
+          # One fixed key, so each new build installs over the previous one. Momiji signs debug builds with
+          # the key named in local.properties; a key copied to ~/.android was ignored and every build got a
+          # new random key (three builds, three certificates), so no build could update another.
+          {
+            echo "sdk.dir=$ANDROID_HOME"
+            echo "chiakiKeystore=$GITHUB_WORKSPACE/stream/vcvr-debug.keystore"
+            echo "chiakiKeystorePW=android"
+            echo "chiakiKeyAlias=androiddebugkey"
+            echo "chiakiKeyPW=android"
+          } > momiji/android/local.properties
           cd momiji/android && chmod +x gradlew && ./gradlew --no-daemon assembleFdroidDebug
           ls -la app/build/outputs/apk/fdroid/debug/
+          # refuse to publish an APK that is not signed with the fixed key
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --print-certs app/build/outputs/apk/fdroid/debug/*.apk | tee /tmp/certs.txt
+          grep -qi "SHA-256 digest: 3a076fe02088a64b1cb50c82ef7e1b8046f99fe729e17faeb599e8cc798be25d" /tmp/certs.txt
 
       - name: Publish APK
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # main -> "stream-latest"; any other branch -> "stream-test", so testing never replaces the release
+          TAG=stream-latest; [[ "$GITHUB_REF" == refs/heads/main ]] || TAG=stream-test
           APK=$(ls momiji/android/app/build/outputs/apk/fdroid/debug/*.apk | head -1)
           cp "$APK" vicecityvr-stream.apk
           sha256sum vicecityvr-stream.apk | tee vicecityvr-stream.apk.sha256
-          gh release delete stream-latest --yes --cleanup-tag || true
-          gh release create stream-latest vicecityvr-stream.apk vicecityvr-stream.apk.sha256 --prerelease \
-            --title "Stream app (build ${GITHUB_RUN_NUMBER})" \
+          gh release delete "$TAG" --yes --cleanup-tag || true
+          gh release create "$TAG" vicecityvr-stream.apk vicecityvr-stream.apk.sha256 --prerelease --target "$GITHUB_SHA" \
+            --title "Stream app ${GITHUB_REF_NAME} (build ${GITHUB_RUN_NUMBER})" \
             --notes "Momiji ${MOMIJI_COMMIT} + motion-vector extraction. Built from ${GITHUB_SHA}."
 
       - uses: actions/upload-artifact@v4
