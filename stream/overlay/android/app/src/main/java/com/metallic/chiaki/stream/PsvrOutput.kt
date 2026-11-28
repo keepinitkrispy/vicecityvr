@@ -95,6 +95,8 @@ class PsvrOutput(private val activity: Activity, display: Display, width: Int, h
         dismiss()
     }
     /** Head tracking, from any thread: the screen stays fixed in space while the head turns */
+    /** Head direction from straight ahead, for the pinned minimap; any thread (drawn with the next setHead) */
+    fun setBody(yaw: Float, pitch: Float) { renderer.bodyYaw = yaw; renderer.bodyPitch = pitch }
     fun setHead(yaw: Float, pitch: Float, size: Float) {
         renderer.headYaw = yaw; renderer.headPitch = pitch; renderer.screenSize = size
         if (!released) glView.requestRender()

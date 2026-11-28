@@ -296,7 +296,8 @@ edit(activity_file, '\tprivate var psvrOutput: PsvrOutput? = null', '''    priva
     private var psvrAlignButton: android.widget.Button? = null
     private val psvrUsb by lazy { PsvrUsb(this, ::refreshPsvrOutput,
         head = { yaw, pitch, size -> psvrOutput?.setHead(yaw, pitch, size) },
-        stick = { x, y -> viewModel.input.setHeadLook(x, y) }) }
+        stick = { x, y -> viewModel.input.setHeadLook(x, y) },
+        body = { yaw, pitch -> psvrOutput?.setBody(yaw, pitch) }) }
 
     private fun refreshPsvrOutput() {
         if (!started || isInPictureInPictureMode) return
@@ -533,8 +534,22 @@ edit(input_file, '''				if(event.actionMasked == MotionEvent.ACTION_DOWN)
 # is untouched.
 edit(video_renderer, '''            uniform int u_PsvrView;''', '''            uniform int u_PsvrView;
             uniform vec2 u_Head;
-            uniform float u_Screen;''')
-edit(video_renderer, '''                vec2 uv = p/u_Picture + .5;''', '''                // view angle of this pixel (480 px focal length: the 960-px picture spans 90 degrees at size 1),
+            uniform float u_Screen;
+            uniform vec2 u_Body;
+            uniform vec4 u_MapSrc;
+            uniform vec4 u_MapAt;''')
+edit(video_renderer, '''                vec2 uv = p/u_Picture + .5;''', '''                // the minimap, pinned low-left in front of you (u_MapAt: left yaw, top pitch, width, height, radians,
+                // left/up positive): it stays put while the head turns, so you can look at it
+                if (u_PsvrView < 2 && u_MapAt.z > 0.) {
+                    vec2 a = atan(p / 480.0);
+                    vec2 q = vec2(u_MapAt.x - (u_Body.x - a.x), u_MapAt.y - (u_Body.y - a.y)) / u_MapAt.zw;
+                    if (all(greaterThanEqual(q, vec2(0.))) && all(lessThanEqual(q, vec2(1.)))) {
+                        vec2 img = u_MapSrc.xy + q * u_MapSrc.zw;      // image coordinates, top-left origin
+                        outColor = vec4(sampleGame(vec2(img.x, 1.0 - img.y)), 1.0);
+                        return;
+                    }
+                }
+                // view angle of this pixel (480 px focal length: the 960-px picture spans 90 degrees at size 1),
                 // minus the head's yaw/pitch (left/up positive; p.y grows downward), over the screen's angular size
                 vec2 ang = atan(p / 480.0) - u_Head;
                 vec2 uv = ang / (2.0 * atan(u_Picture / 960.0) * u_Screen) + .5;''')
@@ -542,10 +557,17 @@ edit(video_renderer, '''    @Volatile var psvrView = PsvrView.FLAT''', '''    @V
     /** Head yaw and pitch (radians, left/up positive) and screen size, from the PSVR's head tracking */
     @Volatile var headYaw = 0f
     @Volatile var headPitch = 0f
-    @Volatile var screenSize = 1.3f''')
+    @Volatile var screenSize = 1.3f
+    @Volatile var bodyYaw = 0f
+    @Volatile var bodyPitch = 0f''')
 edit(video_renderer, '''                GLES30.glUniform1i(stereo.uniformLoc("u_PsvrView"), view.ordinal)''', '''                GLES30.glUniform1i(stereo.uniformLoc("u_PsvrView"), view.ordinal)
                 GLES30.glUniform2f(stereo.uniformLoc("u_Head"), headYaw, headPitch)
-                GLES30.glUniform1f(stereo.uniformLoc("u_Screen"), screenSize)''')
+                GLES30.glUniform1f(stereo.uniformLoc("u_Screen"), screenSize)
+                GLES30.glUniform2f(stereo.uniformLoc("u_Body"), bodyYaw, bodyPitch)
+                // GTA VI minimap: the frame's bottom-left (x 0-25%, y 74-100%), shown 30 x 17.5 degrees,
+                // centred 25 degrees left and 28 below straight ahead
+                GLES30.glUniform4f(stereo.uniformLoc("u_MapSrc"), 0f, 0.74f, 0.25f, 0.26f)
+                GLES30.glUniform4f(stereo.uniformLoc("u_MapAt"), 0.698f, -0.336f, 0.524f, 0.305f)''')
 
 # Recenter the headset view from the controller (L3 + R3 held for a second): headsets without the cable remote
 # have no other button for it.

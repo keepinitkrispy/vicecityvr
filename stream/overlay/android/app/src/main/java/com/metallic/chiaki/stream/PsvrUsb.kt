@@ -24,10 +24,13 @@ import androidx.core.content.ContextCompat
  * The right stick fine-tunes on top ([userStick]); holding L2 ([aiming]) hands aiming to the right stick alone,
  * and afterwards the head carries on from where you aimed. Right-stick click ([lookBehind]): turn around 180
  * degrees. Level the view: L3 + R3 ([recenter]). Align panel: camera speed, delay, screen size.
+ * [body]: the head's yaw/pitch from straight ahead (radians, left/up positive), for the minimap pinned low-left
+ * in front of you, which stays put while the head turns.
  */
 internal class PsvrUsb(private val context: Context, private val changed: () -> Unit,
                        private val head: (Float, Float, Float) -> Unit = { _, _, _ -> },
-                       private val stick: (Float, Float) -> Unit = { _, _ -> }) {
+                       private val stick: (Float, Float) -> Unit = { _, _ -> },
+                       private val body: (Float, Float) -> Unit = { _, _ -> }) {
     private val manager = context.getSystemService(UsbManager::class.java)
     companion object {
         fun permissionAction(context: Context) = context.packageName + ".PSVR_USB_PERMISSION"
@@ -152,7 +155,7 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
             .firstOrNull { it.direction == UsbConstants.USB_DIR_IN } ?: return
         val report = ByteArray(64)
         val bias = FloatArray(3); var biasSamples = 0; var calibrated = false
-        var yaw = 0f; var pitch = 0f; var pitchZero = 0f; var lastTick = -1
+        var yaw = 0f; var pitch = 0f; var pitchZero = 0f; var yawZero = 0f; var lastTick = -1
         var lastSent = 0L
         var buttons = 0
         var muteDownAt = 0L
@@ -234,7 +237,7 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                     if (levelRequested) {                                         // level the view where the head is now
                         levelRequested = false
                         val d = sp * (pitch - pitchZero)
-                        pitchZero = pitch; lastHp -= d; offPitch += d
+                        pitchZero = pitch; lastHp -= d; offPitch += d; yawZero = sx * yaw
                         toast("View leveled")
                     }
                     val headY = sx * yaw + behind; val headP = sp * (pitch - pitchZero)
@@ -246,7 +249,7 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                         wasAiming = true
                         camYaw += uy * dtc; camPitch = (camPitch + up * dtc).coerceIn(-1.3f, 1.3f)
                         lastHy = headY; lastHp = headP
-                        stick(0f, 0f); head(0f, 0f, screenSize)
+                        stick(0f, 0f); head(0f, 0f, screenSize); body(sx * yaw - yawZero, headP)
                         histPos = (histPos + 1) % histYaw.size
                         histYaw[histPos] = camYaw; histPitch[histPos] = camPitch
                         continue
@@ -272,6 +275,7 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                     // a big catch-up (the 180-degree turn) is shown as the stream has it, not shifted
                     val dy = hy - histYaw[then]; val dp = hp - histPitch[then]
                     head(if (kotlin.math.abs(dy) > 0.4f) 0f else dy, if (kotlin.math.abs(dp) > 0.4f) 0f else dp, screenSize)
+                    body(sx * yaw - yawZero, headP)
                 }
             }
         } finally {
