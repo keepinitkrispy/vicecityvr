@@ -555,6 +555,13 @@ edit(input_file, '''		// After sending, so the released buttons of the menu are 
 	}''', '''		// After sending, so the released buttons of the menu are the last state the console gets
 		if(comboPressed)
 			menuComboCallback?.invoke()
+		// Vice City VR: the player's own right stick, for fine-tuning on top of the head
+		if(motionControllerState.rightX != userStickLastX || motionControllerState.rightY != userStickLastY)
+		{
+			userStickLastX = motionControllerState.rightX
+			userStickLastY = motionControllerState.rightY
+			userStickCallback?.invoke(userStickLastX / 32767f, userStickLastY / 32767f)
+		}
 		// Vice City VR: L2 held = aiming, the right stick takes the crosshair back from the head
 		val aimingNow = state.l2State.toInt() > 40
 		if(aimingNow != aimingLast)
@@ -581,6 +588,11 @@ edit(input_file, '''		// After sending, so the released buttons of the menu are 
 		}
 	}
 
+	/** Vice City VR: the player's right stick moved, -1..1, up negative */
+	var userStickCallback: ((Float, Float) -> Unit)? = null
+	private var userStickLastX: Short = 0
+	private var userStickLastY: Short = 0
+
 	/** Vice City VR: right stick clicked while not aiming: look behind / ahead */
 	var lookBehindCallback: (() -> Unit)? = null
 	private var r3Last = false
@@ -598,7 +610,8 @@ edit(input_file, '''		// After sending, so the released buttons of the menu are 
 edit(activity_file, '''		viewModel.input.menuComboCallback = { showStreamMenu() }''', '''		viewModel.input.menuComboCallback = { showStreamMenu() }
 		viewModel.input.recenterCallback = { psvrUsb.recenter() }
 		viewModel.input.aimCallback = { psvrUsb.aiming = it }
-		viewModel.input.lookBehindCallback = { psvrUsb.lookBehind() }''')
+		viewModel.input.lookBehindCallback = { psvrUsb.lookBehind() }
+		viewModel.input.userStickCallback = { x, y -> psvrUsb.userStick(x, y) }''')
 
 # Head-driven camera turns (looking past the comfort zone): a right-stick state of its own, merged like every
 # input source (the larger deflection wins), so the real right stick still aims.
@@ -619,9 +632,15 @@ edit(input_file, '''	private val touchpadControllerState = ControllerState() // 
 			controllerStateUpdated()
 		}
 	}''')
-edit(input_file, '''		val controllerState = sensorControllerState or keyControllerState or motionControllerState or touchpadControllerState
-''', '''		val controllerState = sensorControllerState or keyControllerState or motionControllerState or touchpadControllerState or headControllerState
-''')
+edit(input_file, '''		return controllerState or touchControllerState
+	}''', '''		// Vice City VR: the head's camera turn is added to the player's own right stick (fine-tuning on top)
+		if(headControllerState.rightX.toInt() != 0 || headControllerState.rightY.toInt() != 0)
+		{
+			controllerState.rightX = (controllerState.rightX + headControllerState.rightX).coerceIn(-32768, 32767).toShort()
+			controllerState.rightY = (controllerState.rightY + headControllerState.rightY).coerceIn(-32768, 32767).toShort()
+		}
+		return controllerState or touchControllerState
+	}''')
 
 # The right-stick click belongs to the look-behind turn while not aiming, so the game doesn't also act on it.
 edit(input_file, '''		controllerState.also { state -> controllerStateChangedCallback?.invoke(state) }''', '''		controllerState.also { state ->

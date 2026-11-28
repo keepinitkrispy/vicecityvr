@@ -21,7 +21,9 @@ import androidx.core.content.ContextCompat
  * camera turns with the head as fast as the game allows, and the crosshair is where you face. The picture stays
  * in front of you; while the game catches up (Remote Play delay) it is shifted with the head ([head]: yaw and
  * pitch offset in radians, left/up positive, and the screen size), so the world doesn't drag behind your turns.
- * While aiming (L2, [aiming]) the head lets go and the right stick has the crosshair.
+ * The right stick fine-tunes on top of the head ([userStick]): its nudges stay, and the head carries on from
+ * the corrected direction. While aiming (L2, [aiming]) the head lets go and the right stick has the crosshair;
+ * after aiming the head carries on from where you aimed.
  * The head covers the half of the sphere in front of you; clicking the right stick ([lookBehind]) turns the
  * camera 180 degrees so the same head movements look around the half behind you, and clicking again turns back.
  * Recenter (level the view): hold L3 + R3 for a second ([recenter]). Tuning, in the phone's Align panel:
@@ -127,7 +129,12 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
         private set
     @Volatile private var recenterRequested = false
     /** Puts the screen straight in front of where the head points now; any thread */
-    fun recenter() { recenterRequested = true }
+    fun recenter() { levelRequested = true }
+    @Volatile private var userX = 0f
+    @Volatile private var userY = 0f
+    /** The player's own right stick, -1..1, up negative; any thread */
+    fun userStick(x: Float, y: Float) { userX = x; userY = y }
+    @Volatile private var levelRequested = false
     @Volatile private var lookBehindRequested = false
     /** Turns the view to the half of the sphere behind you, or back; any thread */
     fun lookBehind() { lookBehindRequested = true }
@@ -156,6 +163,7 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
         // camera model: where the game camera points (same frame as the head), and its recent history
         var camYaw = 0f; var camPitch = 0f; var lastHy = 0f; var lastHp = 0f; var wasAiming = true
         var behind = 0f   // 0 or pi: which half of the sphere the head looks around
+        var offYaw = 0f; var offPitch = 0f   // the player's stick corrections, kept on top of the head
         val histYaw = FloatArray(128); val histPitch = FloatArray(128); var histPos = 0
         var camSpeed = prefs.getFloat("cam_speed", 4.0f); var delayMs = prefs.getInt("cam_delay_ms", 80)
         var prefsReadAt = 0L
@@ -169,7 +177,6 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
         try {
             while (started && attempt == generation) {
                 if (usb.bulkTransfer(input, report, report.size, 200) != 64) continue
-                if (recenterRequested) { recenterRequested = false; yaw = 0f; pitchZero = pitch; toast("Screen recentered") }
                 val now = report[0].toInt() and 0xff
                 val pressed = now and buttons.inv(); val released = buttons and now.inv(); buttons = now
                 if (pressed and 8 != 0) muteDownAt = SystemClock.uptimeMillis()                       // mute
@@ -178,7 +185,7 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                         lookFlip = (lookFlip + 1) % 4
                         prefs.edit().putInt("look_flip", lookFlip).apply()
                         toast("Look direction: ${lookFlipNames[lookFlip]}")
-                    } else { yaw = 0f; pitchZero = pitch; toast("Screen recentered") }
+                    } else levelRequested = true
                 }
                 if (pressed and 6 != 0) {                                                             // volume
                     screenSize = (screenSize * if (pressed and 2 != 0) 1.1f else 1f / 1.1f).coerceIn(0.8f, 2.5f)
@@ -227,24 +234,38 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
                         behind = if (behind == 0f) kotlin.math.PI.toFloat() else 0f
                         toast(if (behind == 0f) "Looking ahead" else "Looking behind")
                     }
-                    val hy = sx * yaw + behind; val hp = sp * (pitch - pitchZero)
+                    if (levelRequested) {                                         // level the view where the head is now
+                        levelRequested = false
+                        val d = sp * (pitch - pitchZero)
+                        pitchZero = pitch; lastHp -= d; offPitch += d
+                        toast("View leveled")
+                    }
+                    val headY = sx * yaw + behind; val headP = sp * (pitch - pitchZero)
+                    // how fast the game turns its camera for the player's own stick (it ignores small deflections)
+                    fun rate(v: Float) = if (kotlin.math.abs(v) <= 0.15f) 0f
+                        else kotlin.math.sign(v) * (kotlin.math.abs(v) - 0.15f) / 0.85f * camSpeed
+                    val uy = -rate(userX); val up = -rate(userY)                    // stick right/up = camera right/up
                     if (aiming) {                                                 // the stick has the crosshair
                         wasAiming = true
+                        camYaw += uy * dtc; camPitch = (camPitch + up * dtc).coerceIn(-1.3f, 1.3f)
+                        lastHy = headY; lastHp = headP
                         stick(0f, 0f); head(0f, 0f, screenSize)
-                        lastHy = hy; lastHp = hp
+                        histPos = (histPos + 1) % histYaw.size
+                        histYaw[histPos] = camYaw; histPitch[histPos] = camPitch
                         continue
                     }
-                    if (wasAiming) {                                              // the camera points where you face now
+                    if (wasAiming) {                                              // carry on from where the camera points
                         wasAiming = false
-                        camYaw = hy; camPitch = hp; lastHy = hy; lastHp = hp
-                        histYaw.fill(hy); histPitch.fill(hp)
+                        offYaw = camYaw - headY; offPitch = camPitch - headP; lastHy = headY; lastHp = headP
                     }
-                    // turn rate: the head's own rate, plus catching up whatever the game hasn't turned yet
-                    val wy = ((hy - lastHy) / dtc + (hy - camYaw) * 6f).coerceIn(-camSpeed, camSpeed)
-                    val wp = ((hp - lastHp) / dtc + (hp - camPitch) * 6f).coerceIn(-camSpeed, camSpeed)
-                    lastHy = hy; lastHp = hp
-                    camYaw += wy * dtc; camPitch = (camPitch + wp * dtc).coerceIn(-1.3f, 1.3f)
-                    // looking left = stick left (negative); looking up = stick up (negative)
+                    offYaw += uy * dtc; offPitch += up * dtc                      // stick nudges stay
+                    val hy = headY + offYaw; val hp = headP + offPitch
+                    // head turn rate, plus catching up whatever the game hasn't turned yet
+                    val wy = ((headY - lastHy) / dtc + (hy - camYaw) * 6f).coerceIn(-camSpeed, camSpeed)
+                    val wp = ((headP - lastHp) / dtc + (hp - camPitch) * 6f).coerceIn(-camSpeed, camSpeed)
+                    lastHy = headY; lastHp = headP
+                    camYaw += (wy + uy) * dtc; camPitch = (camPitch + (wp + up) * dtc).coerceIn(-1.3f, 1.3f)
+                    // looking left = stick left (negative); looking up = stick up (negative); added to the player's stick
                     stick(shape(-wy / camSpeed), shape(-wp / camSpeed))
                     // the stream shows the camera as it was [delayMs] ago: shift the picture by what is still missing
                     histPos = (histPos + 1) % histYaw.size
