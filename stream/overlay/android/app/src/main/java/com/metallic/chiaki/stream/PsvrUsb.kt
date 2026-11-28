@@ -20,8 +20,9 @@ import androidx.core.content.ContextCompat
  * tracking. [head] gets the head's yaw and pitch (radians, left and up positive, 0 = straight at the
  * screen) and the screen size, so the game picture stays fixed in space and turning your head looks
  * across it. The game's camera is never touched: aiming stays on the stick.
- * Headset cable remote: tap mute = recenter the screen, hold mute 1 s = next look direction setting
- * (normal, left/right flipped, up/down flipped, both), volume up/down = screen size.
+ * Recenter: hold L3 + R3 on the controller for a second ([recenter]), or tap mute on a headset cable remote.
+ * Cable remote, where there is one: hold mute 1 s = next look direction setting (normal, left/right flipped,
+ * up/down flipped, both), volume up/down = screen size.
  */
 internal class PsvrUsb(private val context: Context, private val changed: () -> Unit,
                        private val head: (Float, Float, Float) -> Unit = { _, _, _ -> }) {
@@ -117,8 +118,11 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
     // ---- head tracking
     private val prefs = context.getSharedPreferences("psvr_live", Context.MODE_PRIVATE)
     /** Screen width as a multiple of the view's width: above 1 there is picture to look at beyond the edges */
-    @Volatile var screenSize = prefs.getFloat("screen_size", 1.3f)
+    @Volatile var screenSize = prefs.getFloat("screen_size", 0.8f)   // the whole picture, HUD corners too, inside the lenses
         private set
+    @Volatile private var recenterRequested = false
+    /** Puts the screen straight in front of where the head points now; any thread */
+    fun recenter() { recenterRequested = true }
     /** bit 0: left/right flipped, bit 1: up/down flipped */
     private var lookFlip = prefs.getInt("look_flip", 0)
     private val lookFlipNames = arrayOf("normal", "left/right flipped", "up/down flipped", "both flipped")
@@ -146,6 +150,7 @@ internal class PsvrUsb(private val context: Context, private val changed: () -> 
         try {
             while (started && attempt == generation) {
                 if (usb.bulkTransfer(input, report, report.size, 200) != 64) continue
+                if (recenterRequested) { recenterRequested = false; yaw = 0f; pitchZero = pitch; toast("Screen recentered") }
                 val now = report[0].toInt() and 0xff
                 val pressed = now and buttons.inv(); val released = buttons and now.inv(); buttons = now
                 if (pressed and 8 != 0) muteDownAt = SystemClock.uptimeMillis()                       // mute

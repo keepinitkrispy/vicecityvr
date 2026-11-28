@@ -545,4 +545,34 @@ edit(video_renderer, '''                GLES30.glUniform1i(stereo.uniformLoc("u_
                 GLES30.glUniform2f(stereo.uniformLoc("u_Head"), headYaw, headPitch)
                 GLES30.glUniform1f(stereo.uniformLoc("u_Screen"), screenSize)''')
 
+# Recenter the headset view from the controller (L3 + R3 held for a second): headsets without the cable remote
+# have no other button for it.
+edit(input_file, '''		// After sending, so the released buttons of the menu are the last state the console gets
+		if(comboPressed)
+			menuComboCallback?.invoke()
+	}''', '''		// After sending, so the released buttons of the menu are the last state the console gets
+		if(comboPressed)
+			menuComboCallback?.invoke()
+		val recenterHeld = state.buttons and RECENTER_COMBO == RECENTER_COMBO
+		if(recenterHeld && !recenterPending)
+		{
+			recenterPending = true
+			recenterHandler.postDelayed(recenterCheck, 1000)
+		}
+		else if(!recenterHeld && recenterPending)
+		{
+			recenterPending = false
+			recenterHandler.removeCallbacks(recenterCheck)
+		}
+	}
+
+	/** Vice City VR: called when L3 + R3 have been held for a second */
+	var recenterCallback: (() -> Unit)? = null
+	private val RECENTER_COMBO = ControllerState.BUTTON_L3 or ControllerState.BUTTON_R3
+	private var recenterPending = false
+	private val recenterHandler = android.os.Handler(android.os.Looper.getMainLooper())
+	private val recenterCheck = Runnable { if(recenterPending) recenterCallback?.invoke() }''')
+edit(activity_file, '''		viewModel.input.menuComboCallback = { showStreamMenu() }''', '''		viewModel.input.menuComboCallback = { showStreamMenu() }
+		viewModel.input.recenterCallback = { psvrUsb.recenter() }''')
+
 print('apply.py: all edits applied')
